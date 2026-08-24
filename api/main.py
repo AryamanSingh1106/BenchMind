@@ -1,17 +1,19 @@
-from fastapi import FastAPI, WebSocket
-import threading
 import asyncio
+import logging
+import time
+import threading
+from fastapi import FastAPI, WebSocket
 
 from benchmarks.cpu_test import run_cpu_test, warmup_cpu
 from benchmarks.gpu_test import run_gpu_test
-from monitoring.live_monitor import TimelineCollector
+from monitoring.telemetry_service import TelemetryService
 from monitoring.system_info import get_system_info
 from ai.stability_engine import calculate_stability
 from ai.summary_engine import generate_summary
 
+logger = logging.getLogger("BenchMind.API")
 
 app = FastAPI()
-
 
 # ===== GLOBAL BENCHMARK STATE =====
 benchmark_state = {
@@ -20,6 +22,18 @@ benchmark_state = {
 }
 
 benchmark_lock = threading.Lock()
+
+
+@app.on_event("startup")
+def startup_event():
+    logger.info("Starting up BenchMind API and TelemetryService...")
+    TelemetryService.get_instance().start()
+
+
+@app.on_event("shutdown")
+def shutdown_event():
+    logger.info("Shutting down BenchMind API and TelemetryService...")
+    TelemetryService.get_instance().stop()
 
 
 # ===== ROOT =====
@@ -31,29 +45,23 @@ def root():
 # ===== SYSTEM INFO =====
 @app.get("/api/system-info")
 def system_info():
-
     info = get_system_info()
     gpu_names = []
 
     try:
         import pyopencl as cl
-
         for platform in cl.get_platforms():
             for device in platform.get_devices():
-
                 name = device.name.strip()
-
                 if "RaptorLake" in name:
                     name = "Intel UHD Graphics"
-
                 gpu_names.append(name)
-
-    except:
+    except Exception as e:
+        logger.debug("Failed to query PyOpenCL devices: %s", e)
         gpu_names = []
 
     info["gpu_count"] = len(gpu_names)
     info["gpus"] = gpu_names
-
     return info
 
 
@@ -66,31 +74,33 @@ def benchmark_status():
 # ===== FULL BENCHMARK =====
 @app.post("/api/full-benchmark")
 def full_benchmark():
-
     with benchmark_lock:
-
         if benchmark_state["status"] in ["warming_up", "running"]:
             return {"message": "Benchmark already running"}
 
         benchmark_state["status"] = "warming_up"
         benchmark_state["result"] = None
 
-    collector = TimelineCollector(interval=0.1)
+    telemetry_service = TelemetryService.get_instance()
+    telemetry_service.start()
 
     warmup_cpu(seconds=2)
 
     benchmark_state["status"] = "running"
-
-    collector.start()
+    start_time = time.monotonic()
 
     cpu_result = run_cpu_test()
     gpu_result = run_gpu_test()
 
-    collector.stop()
+    end_time = time.monotonic()
 
     benchmark_state["status"] = "analyzing"
 
-    logs = collector.get_logs()
+    logs = telemetry_service.get_logs_format(
+        start_time=start_time,
+        end_time=end_time,
+        use_monotonic=True
+    )
     stability = calculate_stability(logs["cpu"])
 
     summary = generate_summary(
@@ -117,7 +127,6 @@ def full_benchmark():
 # ===== DASHBOARD =====
 @app.get("/api/dashboard")
 def dashboard():
-
     if benchmark_state["result"] is None:
         return {
             "status": "no_benchmark_run",
@@ -125,7 +134,6 @@ def dashboard():
         }
 
     result = benchmark_state["result"]
-
     return {
         "status": benchmark_state["status"],
         "system": result["system"],
@@ -139,35 +147,32 @@ def dashboard():
 # ===== REALTIME MONITOR STREAM =====
 @app.websocket("/ws/live-monitor")
 async def live_monitor_socket(websocket: WebSocket):
-
     await websocket.accept()
 
-    collector = TimelineCollector(interval=0.5)
-    collector.start()
+    telemetry_service = TelemetryService.get_instance()
+    telemetry_service.start()
 
-    print("WebSocket monitor started.")
+    logger.info("WebSocket monitor connected.")
 
     try:
         while True:
-
-            logs = collector.get_logs()
+            snapshot = telemetry_service.get_current()
+            if snapshot is None:
+                await asyncio.sleep(0.1)
+                continue
 
             data = {
-                "cpu": logs["cpu"][-1] if logs["cpu"] else None,
-                "ram": logs["ram"][-1] if logs["ram"] else None,
-                "cpu_temp": logs["cpu_temp"][-1] if logs["cpu_temp"] else None,
-                "gpu_temp": logs["gpu_temp"][-1] if logs["gpu_temp"] else None,
+                "cpu": snapshot.cpu_utilization,
+                "ram": snapshot.ram_utilization,
+                "cpu_temp": snapshot.cpu_temp,
+                "gpu_temp": snapshot.gpu_temp,
+                "timestamp": snapshot.timestamp,
             }
 
-            print("WS DATA:", data)
-
             await websocket.send_json(data)
-
             await asyncio.sleep(0.5)
 
     except Exception as e:
-        print("WebSocket error:", repr(e))
-
+        logger.info("WebSocket monitor closed: %s", repr(e))
     finally:
-        collector.stop()
-        print("WebSocket monitor stopped.")
+        logger.info("WebSocket monitor disconnected.")

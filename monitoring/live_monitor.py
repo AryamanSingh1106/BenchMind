@@ -1,70 +1,38 @@
-import psutil
 import time
-import threading
-
-from monitoring.temp_reader import get_temperatures
+from typing import Dict, List, Optional
+from monitoring.telemetry_service import TelemetryService
 
 
 class TimelineCollector:
 
-    def __init__(self, interval=0.2):
+    def __init__(self, interval: float = 0.2):
         self.interval = interval
+        self.service = TelemetryService.get_instance(interval=self.interval)
+        self.start_mono: Optional[float] = None
+        self.end_mono: Optional[float] = None
         self.running = False
-        self.thread = None
-
-        # timeline logs
-        self.cpu_log = []
-        self.ram_log = []
-        self.cpu_temp_log = []
-        self.gpu_temp_log = []
-        self.timestamp_log = []
-
-    # ===== MAIN LOOP =====
-    def collect_data(self):
-
-        while self.running:
-
-            # CPU + RAM
-            cpu = psutil.cpu_percent(interval=None)
-            ram = psutil.virtual_memory().percent
-
-            # temps from LibreHardwareMonitor
-            temps = get_temperatures()
-
-            cpu_temp = temps.get("cpu_temp")
-            gpu_temp = temps.get("gpu_temp")
-
-            # store logs
-            self.cpu_log.append(cpu)
-            self.ram_log.append(ram)
-            self.cpu_temp_log.append(cpu_temp)
-            self.gpu_temp_log.append(gpu_temp)
-            self.timestamp_log.append(time.time())
-
-            time.sleep(self.interval)
 
     # ===== START =====
     def start(self):
-        if not self.running:
-            self.running = True
-            self.thread = threading.Thread(
-                target=self.collect_data,
-                daemon=True
-            )
-            self.thread.start()
+        self.start_mono = time.monotonic()
+        self.end_mono = None
+        self.running = True
+        self.service.start()
 
     # ===== STOP =====
     def stop(self):
-        self.running = False
-        if self.thread:
-            self.thread.join()
+        if self.running:
+            self.end_mono = time.monotonic()
+            self.running = False
 
     # ===== GET LOGS =====
-    def get_logs(self):
-        return {
-            "cpu": self.cpu_log,
-            "ram": self.ram_log,
-            "cpu_temp": self.cpu_temp_log,
-            "gpu_temp": self.gpu_temp_log,
-            "time": self.timestamp_log,
-        }
+    def get_logs(self) -> Dict[str, List]:
+        if self.start_mono is None:
+            return self.service.get_logs_format()
+        
+        end_time = self.end_mono if not self.running and self.end_mono is not None else time.monotonic()
+        return self.service.get_logs_format(
+            start_time=self.start_mono,
+            end_time=end_time,
+            use_monotonic=True
+        )

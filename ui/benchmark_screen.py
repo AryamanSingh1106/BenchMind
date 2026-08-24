@@ -1,6 +1,5 @@
 import sys
 import threading
-import psutil
 import pyqtgraph as pg
 
 from PyQt5.QtWidgets import (
@@ -10,10 +9,9 @@ from PyQt5.QtWidgets import (
     QPushButton,
     QLabel,
 )
-
 from PyQt5.QtCore import QTimer
 
-from monitoring.live_monitor import TimelineCollector
+from monitoring.telemetry_service import TelemetryService
 from benchmarks.cpu_test import run_cpu_test
 from ai.stability_engine import calculate_stability
 
@@ -52,17 +50,21 @@ class BenchmarkScreen(QWidget):
         # ===== DATA =====
         self.graph_data = []
 
-        self.collector = TimelineCollector(interval=0.2)
+        # Consume centralized TelemetryService
+        self.service = TelemetryService.get_instance(interval=0.2)
+        self.service.start()
 
-        # timer for live graph
+        # timer for live graph update from central TelemetryService
         self.timer = QTimer()
         self.timer.timeout.connect(self.update_graph)
         self.timer.start(200)
 
     def update_graph(self):
-        cpu = psutil.cpu_percent()
+        snapshot = self.service.get_current()
+        if snapshot is None:
+            return
 
-        self.graph_data.append(cpu)
+        self.graph_data.append(snapshot.cpu_utilization)
 
         if len(self.graph_data) > 100:
             self.graph_data.pop(0)
@@ -70,35 +72,39 @@ class BenchmarkScreen(QWidget):
         self.curve.setData(self.graph_data)
 
     def benchmark_worker(self):
-
-        self.collector.start()
+        import time
+        start_mono = time.monotonic()
 
         result = run_cpu_test()
 
-        self.collector.stop()
+        end_mono = time.monotonic()
 
         self.status_label.setText("Status: Analyzing Stability...")
 
-        logs = self.collector.get_logs()
+        logs = self.service.get_logs_format(
+            start_time=start_mono,
+            end_time=end_mono,
+            use_monotonic=True
+        )
         stability = calculate_stability(logs["cpu"])
 
+        single = result.get("single_core_score", "--")
+        multi = result.get("multi_core_score", "--")
+
         self.result_label.setText(
-            f"CPU Score: {result['cpu_score']}"
-         )
+            f"Single-Core: {single} | Multi-Core: {multi}"
+        )
 
         self.stability_label.setText(
             f"Stability Score: {stability}%"
-         )
+        )
 
         self.status_label.setText("Status: Finished ✔")
 
         self.run_button.setText("Run CPU Benchmark")
         self.run_button.setEnabled(True)
 
-        self.run_button.setEnabled(True)
-
     def start_benchmark(self):
-
         # reset UI
         self.graph_data.clear()
         self.curve.setData([])
@@ -110,8 +116,12 @@ class BenchmarkScreen(QWidget):
         self.run_button.setText("Running...")
         self.run_button.setEnabled(False)
 
-        thread = threading.Thread(target=self.benchmark_worker)
+        thread = threading.Thread(target=self.benchmark_worker, daemon=True)
         thread.start()
+
+    def closeEvent(self, event):
+        self.timer.stop()
+        super().closeEvent(event)
 
 
 if __name__ == "__main__":
