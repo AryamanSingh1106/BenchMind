@@ -5,29 +5,16 @@ import logging
 from typing import List, Tuple, Dict, Any
 
 from benchmarks.cpu.common import SubtestResult, calculate_subtest_score, geometric_mean
-from benchmarks.cpu.integer import integer_workload, validate_integer_workload
-from benchmarks.cpu.floating_point import floating_point_workload, validate_floating_point_workload
-from benchmarks.cpu.matrix import matrix_workload, validate_matrix_workload
-from benchmarks.cpu.compression import compression_workload, validate_compression_workload
-from benchmarks.cpu.hashing import hashing_workload, validate_hashing_workload
+from benchmarks.cpu.integer import validate_integer_workload
+from benchmarks.cpu.floating_point import validate_floating_point_workload
+from benchmarks.cpu.matrix import validate_matrix_workload
+from benchmarks.cpu.compression import validate_compression_workload
+from benchmarks.cpu.hashing import validate_hashing_workload
+
+# Import the worker from a dedicated top-level module so Windows 'spawn' can reimport it cleanly
+from benchmarks.cpu._worker import _worker_task
 
 logger = logging.getLogger("BenchMind.CPU.MultiCore")
-
-
-def _worker_task(workload_type: str) -> Tuple[Any, float]:
-    """Top-level worker function for ProcessPoolExecutor serialization."""
-    if workload_type == "integer":
-        return integer_workload(iterations=200_000)
-    elif workload_type == "floating_point":
-        return floating_point_workload(array_size=500_000, loops=15)
-    elif workload_type == "matrix":
-        return matrix_workload(size=384)
-    elif workload_type == "compression":
-        return compression_workload(buffer_size_mb=5.0)
-    elif workload_type == "hashing":
-        return hashing_workload(buffer_size_mb=8.0, passes=3)
-    else:
-        raise ValueError(f"Unknown workload_type: {workload_type}")
 
 
 def run_multi_core_subtest(
@@ -43,6 +30,8 @@ def run_multi_core_subtest(
     """
     Executes multi-core subtest via dynamic ProcessPoolExecutor task queue chunking.
     Uses time.perf_counter() for precise multi-core performance duration measurement.
+    Worker dispatch is handled by benchmarks.cpu._worker._worker_task, which is
+    a dedicated spawn-safe top-level module on Windows.
     """
     total_tasks = num_workers * chunks_per_worker
     start_total = time.perf_counter()
@@ -117,7 +106,6 @@ def run_multi_core_suite() -> Tuple[List[SubtestResult], float, float, int]:
     start_time = time.perf_counter()
     results: List[SubtestResult] = []
 
-    # Run multi-core subtest workloads
     results.append(run_multi_core_subtest(
         name="Multi-Core Integer Compute",
         category="integer",
