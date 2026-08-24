@@ -1,76 +1,37 @@
 import time
 import multiprocessing
+from benchmarks.cpu.cpu_suite import run_full_cpu_suite
+from benchmarks.cpu.integer import integer_workload
 
 multiprocessing.freeze_support()
 
 
-# ===== WORKLOAD =====
-def cpu_worker(iterations):
-    result = 0
-    for i in range(iterations):
-        result += (i * i) % 97
-    return result
+def warmup_cpu(seconds: float = 2.0):
+    """Warmup CPU execution units."""
+    end_time = time.monotonic() + seconds
+    while time.monotonic() < end_time:
+        integer_workload(iterations=100_000)
 
 
-# ===== WARM-UP =====
-def warmup_cpu(seconds=2):
-    end_time = time.time() + seconds
-    while time.time() < end_time:
-        cpu_worker(1_000_000)
+def run_cpu_test() -> dict:
+    """
+    Backward-compatible entry point for CPU benchmark.
+    Executes the modular CPU Benchmark Suite and returns both legacy keys
+    and new BenchMind CPU Index metrics.
+    """
+    suite_result = run_full_cpu_suite(mode="quick")
 
-
-# ===== SINGLE CORE =====
-def run_single_core_test(iterations=80_000_000):
-
-    start = time.time()
-
-    result = cpu_worker(iterations)
-
-    elapsed = time.time() - start
-
-    raw_score = result / elapsed
-    score = round(raw_score / 500000)
-
-    return score, elapsed
-
-
-# ===== MULTI CORE =====
-def run_multi_core_test(total_iterations=1_000_000_000):
-
-    logical_cores = multiprocessing.cpu_count()
-    iterations_per_core = total_iterations // logical_cores
-
-    start = time.time()
-
-    with multiprocessing.Pool(processes=logical_cores) as pool:
-        results = pool.map(
-            cpu_worker,
-            [iterations_per_core] * logical_cores
-        )
-
-    elapsed = time.time() - start
-
-    raw_score = sum(results) / elapsed
-    score = round(raw_score / 500000)
-
-    return score, elapsed, logical_cores
-
-
-# ===== MAIN CPU TEST =====
-def run_cpu_test():
-
-    # warm-up first
-    warmup_cpu(seconds=2)
-
-    single_score, single_time = run_single_core_test()
-    multi_score, multi_time, cores = run_multi_core_test()
-
+    # Map to backward-compatible keys expected by existing callers
     return {
-        "single_core_score": single_score,
-        "multi_core_score": multi_score,
-        "single_core_time": single_time,
-        "multi_core_time": multi_time,
-        "cores_used": cores,
+        "single_core_score": round(suite_result["single_core_score"]),
+        "multi_core_score": round(suite_result["multi_core_score"]),
+        "single_core_time": suite_result["single_core_time"],
+        "multi_core_time": suite_result["multi_core_time"],
+        "cores_used": suite_result["cores_used"],
+        "cpu_index": round(suite_result["cpu_index"]),
+        "category_scores": suite_result["category_scores"],
+        "subtests": suite_result["subtests"],
+        "telemetry_summary": suite_result["telemetry_summary"]
     }
 
 
