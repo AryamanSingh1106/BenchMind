@@ -1,0 +1,4 @@
+-r requirements.txt
+
+# Test client for tests/test_api.py
+httpx>=0.24

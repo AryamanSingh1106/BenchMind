@@ -1,72 +1,85 @@
+"""
+Dense matrix multiplication (BLAS dgemm).
+
+1.x regenerated two 768x768 float64 matrices with two RNG streams inside the
+timed function on every repetition. Filling ~1.2 million doubles is not free,
+and it was being charged against the GFLOPS number.
+
+2.0 allocates A, B and the output buffer once in `setup` and calls
+`np.matmul(A, B, out=C)` in the timed region, so the measurement is dgemm and
+nothing else.
+
+Note honestly what this measures: your BLAS build. The same silicon will score
+differently under OpenBLAS, MKL and the NumPy reference build. The BLAS vendor
+and version are captured in the environment fingerprint for exactly this
+reason.
+"""
+
+from __future__ import annotations
+
+from typing import Any, Dict, Tuple
+
 import numpy as np
-from typing import Tuple, Dict, Any
-from benchmarks.cpu.common import run_timed_subtest, SubtestResult
+
+SIZE = 768
+LOOPS = 3
 
 
-def matrix_workload(size: int = 768, loops: int = 3) -> Tuple[Dict[str, Any], float]:
-    """
-    Deterministic Matrix Multiplication (C = A x B)
-    - Mixed compute + memory-hierarchy workload
-    - Size: 768x768 float64 matrices (3 loops)
-    - FLOP Count: loops * 2 * N^3 floating point operations
-    """
+def setup(scale: float = 1.0) -> Dict[str, Any]:
+    # Matrix dimension is fixed. A 384x384 matmul and a 768x768 matmul sit in
+    # different cache regimes and are not the same measurement, so `scale`
+    # changes the repetition count rather than the size.
+    size = SIZE
     rng_a = np.random.default_rng(12345)
     rng_b = np.random.default_rng(67890)
-
-    A = rng_a.uniform(0.1, 2.0, size=(size, size)).astype(np.float64)
-    B = rng_b.uniform(0.1, 2.0, size=(size, size)).astype(np.float64)
-
-    C = A
-    for _ in range(loops):
-        C = np.matmul(A, B)
-
-    # loops * 2 * N^3 FLOPS
-    total_flops = float(loops) * 2.0 * (size ** 3)
-
-    output = {
-        "matrix_sum": float(np.sum(C)),
-        "matrix_trace": float(np.trace(C)),
+    return {
         "size": size,
-        "c_00": float(C[0, 0]),
-        "c_mid": float(C[size // 2, size // 2])
+        "loops": max(1, int(LOOPS * scale)),
+        "A": np.ascontiguousarray(rng_a.uniform(0.1, 2.0, size=(size, size)), dtype=np.float64),
+        "B": np.ascontiguousarray(rng_b.uniform(0.1, 2.0, size=(size, size)), dtype=np.float64),
+        "C": np.empty((size, size), dtype=np.float64),
     }
 
-    # Scale total ops to GigaFLOPS (GFLOPS)
-    return output, total_flops / 1e9
+
+def run(ctx: Dict[str, Any]) -> Tuple[Dict[str, Any], float]:
+    A, B, C = ctx["A"], ctx["B"], ctx["C"]
+    size, loops = ctx["size"], ctx["loops"]
+
+    for _ in range(loops):
+        np.matmul(A, B, out=C)
+
+    total_flops = float(loops) * 2.0 * (size ** 3)
+    return (
+        {
+            "matrix_sum": float(np.sum(C)),
+            "matrix_trace": float(np.trace(C)),
+            "c_00": float(C[0, 0]),
+            "c_mid": float(C[size // 2, size // 2]),
+            "size": size,
+        },
+        total_flops / 1e9,
+    )
 
 
-def validate_matrix_workload(output: Dict[str, Any]) -> bool:
+def validate(output: Dict[str, Any]) -> bool:
     """
-    Validate matrix multiplication output outside the timed block:
-    Checks trace, element sum, and finite value bounds.
+    Verify against an independently computed reference element rather than
+    only checking for NaN. C[0,0] must equal dot(A[0,:], B[:,0]).
     """
     if not isinstance(output, dict):
         return False
-
-    matrix_sum = output.get("matrix_sum")
-    matrix_trace = output.get("matrix_trace")
+    size = output.get("size")
     c_00 = output.get("c_00")
+    matrix_sum = output.get("matrix_sum")
+    if not size or c_00 is None or matrix_sum is None:
+        return False
+    if not np.isfinite(c_00) or not np.isfinite(matrix_sum) or matrix_sum <= 0:
+        return False
 
-    if matrix_sum is None or matrix_trace is None or c_00 is None:
-        return False
-    if np.isnan(matrix_sum) or np.isinf(matrix_sum):
-        return False
-    if np.isnan(matrix_trace) or np.isinf(matrix_trace):
-        return False
-    if matrix_sum <= 0 or matrix_trace <= 0:
-        return False
-    return True
+    rng_a = np.random.default_rng(12345)
+    rng_b = np.random.default_rng(67890)
+    a_row = rng_a.uniform(0.1, 2.0, size=(size, size))[0, :]
+    b_col = rng_b.uniform(0.1, 2.0, size=(size, size))[:, 0]
+    expected = float(np.dot(a_row, b_col))
 
-
-def run_matrix_subtest(target_duration: float = 1.0) -> SubtestResult:
-    return run_timed_subtest(
-        name="Matrix Compute (Deterministic A x B)",
-        category="matrix",
-        workload_profile="mixed",
-        raw_metric_name="GFLOPS",
-        workload_fn=matrix_workload,
-        validate_fn=validate_matrix_workload,
-        target_duration=target_duration,
-        min_reps=3,
-        max_reps=5
-    )
+    return abs(c_00 - expected) <= max(1e-6, abs(expected) * 1e-9)

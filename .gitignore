@@ -1,5 +1,25 @@
 venv/
+.venv/
 __pycache__/
 *.pyc
+*.pyo
 *.log
 .env
+.DS_Store
+.idea/
+.vscode/
+
+# Downloaded on demand by scripts/fetch_tools.py, not committed.
+# LibreHardwareMonitor is MPL-2.0; vendoring the binaries without a notice
+# does not satisfy that licence.
+tools/
+
+# Local benchmark history
+*.db
+.benchmind/
+
+build/
+dist/
+*.egg-info/
+.coverage
+htmlcov/

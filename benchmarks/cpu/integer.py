@@ -1,69 +1,106 @@
-import math
-from typing import Tuple, Dict, Any
-from benchmarks.cpu.common import run_timed_subtest, SubtestResult
+"""
+Integer ALU throughput.
+
+BenchMind 1.x used a pure-Python bit-rotation loop plus a Python-list Sieve of
+Eratosthenes. That measured the CPython interpreter, not the integer units:
+the score moved when you upgraded Python without touching the hardware.
+
+2.0 splits the concern in two:
+  * this module      -> int64 SIMD ALU work through NumPy, counted in the CPU Index
+  * interpreter.py   -> the old-style pure-Python loop, reported but NOT counted
+
+Working set is sized to stay inside L2 on a typical core, so the result
+reflects ALU throughput rather than memory bandwidth. All masks are chosen so
+no int64 operation can overflow, which keeps the checksum exactly reproducible
+across platforms.
+"""
+
+from __future__ import annotations
+
+from typing import Any, Dict, Tuple
+
+import numpy as np
+
+ELEMENTS = 65_536           # 512 KB per int64 array
+LOOPS = 120
+VALUE_MASK = 0x0003_FFFF_FFFF_FFFF   # ~2^50, so (x << 7) stays inside int64
+SEED_BASE = 12345
+SEED_ODD = 67890
 
 
-def integer_workload(iterations: int = 300_000) -> Tuple[Dict[str, Any], float]:
-    """
-    Integer compute workload:
-    - Bitwise shifts, bit rotation, 64-bit mask ops
-    - Sieve of Eratosthenes prime generation up to N=500,000
-    """
-    # 1. Bit manipulation loop
-    accumulator = 0x123456789ABCDEF0
-    for i in range(1, iterations + 1):
-        accumulator = ((accumulator << 7) | (accumulator >> 57)) & 0xFFFFFFFFFFFFFFFF
-        accumulator ^= (i * 0x9E3779B97F4A7C15) & 0xFFFFFFFFFFFFFFFF
-        accumulator = (accumulator + (i & 0xFFFF)) & 0xFFFFFFFFFFFFFFFF
+def _make_arrays(n: int):
+    base = np.random.default_rng(SEED_BASE).integers(
+        1, VALUE_MASK, size=n, dtype=np.int64)
+    odd = np.random.default_rng(SEED_ODD).integers(
+        1, 2**30, size=n, dtype=np.int64)
+    return base, odd
 
-    # 2. Sieve of Eratosthenes up to N=500,000
-    n = 500_000
-    sieve = [True] * n
-    sieve[0] = sieve[1] = False
-    for p in range(2, int(math.isqrt(n)) + 1):
-        if sieve[p]:
-            for multiple in range(p * p, n, p):
-                sieve[multiple] = False
 
-    prime_count = sum(sieve)
-    total_ops = (iterations * 10) + n  # Operations performed
-
-    output = {
-        "accumulator": accumulator,
-        "prime_count": prime_count,
-        "sieve_limit": n
+def setup(scale: float = 1.0) -> Dict[str, Any]:
+    # SCALE TIME, NOT WORKING SET. The array size is fixed so the workload
+    # stays L2-resident in every mode; `scale` only changes how many passes
+    # are made. Shrinking the buffer instead would change which cache level
+    # the workload lives in, and quick-mode scores would measure something
+    # different from standard-mode scores.
+    n = ELEMENTS
+    base, odd = _make_arrays(n)
+    return {
+        "n": n,
+        "loops": max(1, int(LOOPS * scale)),
+        "base": base,
+        "odd": odd,
+        "acc": np.empty(n, dtype=np.int64),
+        "tmp": np.empty(n, dtype=np.int64),
     }
 
-    # Scale total ops to Millions (Mops)
-    return output, total_ops / 1e6
+
+def _kernel(acc: np.ndarray, tmp: np.ndarray, odd: np.ndarray, loops: int) -> None:
+    """Six int64 operations per element per loop, fully in place."""
+    for _ in range(loops):
+        np.left_shift(acc, 7, out=tmp)
+        np.right_shift(acc, 5, out=acc)
+        np.bitwise_or(tmp, acc, out=acc)
+        np.bitwise_xor(acc, odd, out=acc)
+        np.add(acc, odd, out=acc)
+        np.bitwise_and(acc, VALUE_MASK, out=acc)
 
 
-def validate_integer_workload(output: Dict[str, Any]) -> bool:
+def run(ctx: Dict[str, Any]) -> Tuple[Dict[str, Any], float]:
+    acc, tmp = ctx["acc"], ctx["tmp"]
+    n, loops = ctx["n"], ctx["loops"]
+
+    np.copyto(acc, ctx["base"])
+    _kernel(acc, tmp, ctx["odd"], loops)
+
+    checksum = int(np.bitwise_xor.reduce(acc))
+    total_ops = 6.0 * n * loops
+    return {"checksum": checksum, "n": n, "loops": loops}, total_ops / 1e6
+
+
+_REFERENCE_CACHE: Dict[Tuple[int, int], int] = {}
+
+
+def _reference_checksum(n: int, loops: int) -> int:
+    base, odd = _make_arrays(n)
+    acc = base.copy()
+    tmp = np.empty(n, dtype=np.int64)
+    _kernel(acc, tmp, odd, loops)
+    return int(np.bitwise_xor.reduce(acc))
+
+
+def validate(output: Dict[str, Any]) -> bool:
     """
-    Validate integer output:
-    Prime count up to 500,000 is mathematically known to be exactly 41,538.
-    Check that accumulator is an integer.
+    Integer arithmetic is exact, so the checksum is deterministic for a given
+    (n, loops). The reference is recomputed once per shape, outside the timed
+    region, rather than hardcoded as a magic constant.
     """
     if not isinstance(output, dict):
         return False
-    prime_count = output.get("prime_count")
-    accumulator = output.get("accumulator")
-    if prime_count != 41538:
+    checksum, n, loops = output.get("checksum"), output.get("n"), output.get("loops")
+    if not isinstance(checksum, int) or n is None or loops is None:
         return False
-    if not isinstance(accumulator, int):
-        return False
-    return True
 
-
-def run_integer_subtest(target_duration: float = 1.0) -> SubtestResult:
-    return run_timed_subtest(
-        name="Integer Compute (Bitwise & Sieve)",
-        category="integer",
-        workload_profile="compute_bound",
-        raw_metric_name="Mops/sec",
-        workload_fn=integer_workload,
-        validate_fn=validate_integer_workload,
-        target_duration=target_duration,
-        min_reps=3,
-        max_reps=5
-    )
+    key = (int(n), int(loops))
+    if key not in _REFERENCE_CACHE:
+        _REFERENCE_CACHE[key] = _reference_checksum(*key)
+    return checksum == _REFERENCE_CACHE[key]

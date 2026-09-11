@@ -1,70 +1,76 @@
+"""
+Streaming vector throughput, DRAM-resident.
+
+This workload is deliberately memory bound. Its working set is far larger than
+last-level cache, so what it measures is sustained memory bandwidth plus
+vectorized execution, not peak SIMD compute. The 1.x docstring claimed SIMD
+compute; the profile below now says `memory_bound`, which is the truth.
+
+Comparing this against floating_point.py (L2-resident, same kernel shape) is
+what drives the roofline analysis in ai/analysis.py.
+"""
+
+from __future__ import annotations
+
+from typing import Any, Dict, Tuple
+
 import numpy as np
-from typing import Tuple, Dict, Any
-from benchmarks.cpu.common import run_timed_subtest, SubtestResult
+
+ELEMENTS = 8_000_000     # 32 MB per float32 array, past LLC on most machines
+LOOPS = 6
 
 
-def vector_simd_workload(vector_size: int = 2_000_000, loops: int = 25) -> Tuple[Dict[str, Any], float]:
-    """
-    Vectorized NumPy/SIMD-capable Workload:
-    - Contiguous array Fused Multiply-Add (FMA) & Vector Dot Product
-    - Vector size: 2,000,000 float32 elements
-    """
+def setup(scale: float = 1.0) -> Dict[str, Any]:
+    # The array size is deliberately NOT scaled. This workload only means
+    # anything while its working set is larger than last-level cache; shrink
+    # it for quick mode and it quietly becomes a cache benchmark reporting a
+    # much higher number. `scale` changes the pass count instead.
+    n = ELEMENTS
     rng = np.random.default_rng(999)
-    v1 = rng.uniform(0.1, 1.0, size=vector_size).astype(np.float32)
-    v2 = rng.uniform(0.1, 1.0, size=vector_size).astype(np.float32)
-    v3 = rng.uniform(0.01, 0.5, size=vector_size).astype(np.float32)
-    res = np.zeros(vector_size, dtype=np.float32)
-
-    # Vectorized FMA loop (2 FLOPS per element per loop)
-    for _ in range(loops):
-        res = v1 * v2 + v3
-
-    # Dot product (2 FLOPS per element)
-    dot_val = float(np.dot(v1, v2))
-
-    total_flops = (2.0 * vector_size * loops) + (2.0 * vector_size)
-
-    output = {
-        "res_sum": float(np.sum(res)),
-        "dot_val": dot_val,
-        "vector_size": vector_size,
-        "loops": loops
+    return {
+        "n": n,
+        "loops": max(1, int(LOOPS * scale)),
+        "v1": rng.uniform(0.1, 1.0, size=n).astype(np.float32),
+        "v2": rng.uniform(0.1, 1.0, size=n).astype(np.float32),
+        "v3": rng.uniform(0.01, 0.5, size=n).astype(np.float32),
+        "res": np.zeros(n, dtype=np.float32),
+        "tmp": np.zeros(n, dtype=np.float32),
     }
 
-    # Scale total ops to GigaFLOPS (GFLOPS)
-    return output, total_flops / 1e9
+
+def run(ctx: Dict[str, Any]) -> Tuple[Dict[str, Any], float]:
+    n, loops = ctx["n"], ctx["loops"]
+    v1, v2, v3 = ctx["v1"], ctx["v2"], ctx["v3"]
+    res, tmp = ctx["res"], ctx["tmp"]
+
+    for _ in range(loops):
+        np.multiply(v1, v2, out=tmp)
+        np.add(tmp, v3, out=res)
+
+    dot_val = float(np.dot(v1, v2))
+
+    total_flops = (2.0 * n * loops) + (2.0 * n)
+    return (
+        {"res_sum": float(np.sum(res)), "dot_val": dot_val, "n": n, "loops": loops},
+        total_flops / 1e9,
+    )
 
 
-def validate_vector_simd_workload(output: Dict[str, Any]) -> bool:
-    """
-    Validate vectorized workload output:
-    Checks result array sum and dot product bounds outside the timed block.
-    """
+def bytes_per_run(n: int = ELEMENTS, loops: int = LOOPS) -> float:
+    """3 float32 reads + 1 write per element per loop, plus the dot product."""
+    return (4.0 * 4 * n * loops) + (2.0 * 4 * n)
+
+
+def validate(output: Dict[str, Any]) -> bool:
     if not isinstance(output, dict):
         return False
-    res_sum = output.get("res_sum")
-    dot_val = output.get("dot_val")
-
-    if res_sum is None or dot_val is None:
+    res_sum, dot_val, n = output.get("res_sum"), output.get("dot_val"), output.get("n")
+    if res_sum is None or dot_val is None or not n:
         return False
-    if np.isnan(res_sum) or np.isinf(res_sum):
-        return False
-    if np.isnan(dot_val) or np.isinf(dot_val):
+    if not np.isfinite(res_sum) or not np.isfinite(dot_val):
         return False
     if res_sum <= 0 or dot_val <= 0:
         return False
-    return True
-
-
-def run_vector_simd_subtest(target_duration: float = 1.0) -> SubtestResult:
-    return run_timed_subtest(
-        name="Vectorized NumPy/SIMD-Capable",
-        category="vector_simd",
-        workload_profile="vectorized",
-        raw_metric_name="GFLOPS",
-        workload_fn=vector_simd_workload,
-        validate_fn=validate_vector_simd_workload,
-        target_duration=target_duration,
-        min_reps=3,
-        max_reps=5
-    )
+    # v1*v2 in [0.01, 1.0] plus v3 in [0.01, 0.5]; mean result must land in range.
+    mean_res = res_sum / n
+    return 0.05 < mean_res < 1.6

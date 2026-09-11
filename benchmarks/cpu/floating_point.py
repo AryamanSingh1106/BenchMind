@@ -1,74 +1,92 @@
+"""
+Floating-point FMA throughput, L2-resident.
+
+The 1.x version allocated six one-million-element arrays and generated six
+million random numbers *inside* the timed region, then did 20 cheap passes over
+them. Most of the measured time was the RNG, and the arrays were far too large
+to sit in cache, so the number reported as MFLOPS was really DRAM bandwidth.
+
+2.0 sizes the working set to roughly 768 KB so it stays in L2 on a typical
+core, runs many more passes, and does all arithmetic in place with `out=`
+so nothing is allocated while the clock is running.
+
+Pair this with vector_simd.py, which deliberately uses a DRAM-sized working
+set. The two together tell you where the machine falls off the cache cliff.
+"""
+
+from __future__ import annotations
+
+from typing import Any, Dict, Tuple
+
 import numpy as np
-from typing import Tuple, Dict, Any
-from benchmarks.cpu.common import run_timed_subtest, SubtestResult
+
+ELEMENTS = 65_536      # 256 KB as float32, 512 KB as float64
+LOOPS = 150
 
 
-def floating_point_workload(array_size: int = 1_000_000, loops: int = 20) -> Tuple[Dict[str, Any], float]:
-    """
-    Controlled FP32 and FP64 arithmetic throughput workload:
-    - FP32 FMA / Multiply-Add loop: x = x * a + b
-    - FP64 FMA / Multiply-Add loop: y = y * c + d
-    """
-    # Deterministic array generation with fixed seed
+def setup(scale: float = 1.0) -> Dict[str, Any]:
+    # Array size fixed so the working set stays L2-resident in every mode;
+    # `scale` changes the pass count only. See integer.py for the rationale.
+    n = ELEMENTS
     rng = np.random.default_rng(42)
-    a32 = rng.uniform(0.5, 1.5, size=array_size).astype(np.float32)
-    b32 = rng.uniform(0.01, 0.1, size=array_size).astype(np.float32)
-    x32 = np.ones(array_size, dtype=np.float32)
-
-    a64 = rng.uniform(0.5, 1.5, size=array_size).astype(np.float64)
-    b64 = rng.uniform(0.01, 0.1, size=array_size).astype(np.float64)
-    y64 = np.ones(array_size, dtype=np.float64)
-
-    # Arithmetic throughput loop (2 FLOPS per element per loop for FP32, 2 FLOPS for FP64)
-    for _ in range(loops):
-        x32 = x32 * a32 + b32
-        y64 = y64 * a64 + b64
-
-    # Calculate total floating point operations
-    # Each loop does (2 FLOPS * array_size) for FP32 + (2 FLOPS * array_size) for FP64
-    total_flops = 4.0 * array_size * loops
-
-    output = {
-        "x32_sum": float(np.sum(x32)),
-        "y64_sum": float(np.sum(y64)),
-        "array_size": array_size,
-        "loops": loops
+    return {
+        "n": n,
+        "loops": max(1, int(LOOPS * scale)),
+        # a in [0.90, 0.99] keeps x = x*a + b convergent rather than divergent,
+        # so FP32 and FP64 stay in agreement and validation is meaningful.
+        "a32": rng.uniform(0.90, 0.99, size=n).astype(np.float32),
+        "b32": rng.uniform(0.01, 0.1, size=n).astype(np.float32),
+        "x32": np.ones(n, dtype=np.float32),
+        "a64": rng.uniform(0.90, 0.99, size=n).astype(np.float64),
+        "b64": rng.uniform(0.01, 0.1, size=n).astype(np.float64),
+        "y64": np.ones(n, dtype=np.float64),
     }
 
-    # Scale total ops to Millions (MFLOPS)
-    return output, total_flops / 1e6
+
+def run(ctx: Dict[str, Any]) -> Tuple[Dict[str, Any], float]:
+    n, loops = ctx["n"], ctx["loops"]
+    a32, b32, x32 = ctx["a32"], ctx["b32"], ctx["x32"]
+    a64, b64, y64 = ctx["a64"], ctx["b64"], ctx["y64"]
+
+    # Reset accumulators so every rep does identical work (cheap: one pass).
+    x32.fill(1.0)
+    y64.fill(1.0)
+
+    for _ in range(loops):
+        np.multiply(x32, a32, out=x32)
+        np.add(x32, b32, out=x32)
+        np.multiply(y64, a64, out=y64)
+        np.add(y64, b64, out=y64)
+
+    # 2 FLOPs per element per loop for FP32 plus 2 for FP64.
+    total_flops = 4.0 * n * loops
+    return (
+        {"x32_sum": float(np.sum(x32)), "y64_sum": float(np.sum(y64)),
+         "n": n, "loops": loops},
+        total_flops / 1e6,
+    )
 
 
-def validate_floating_point_workload(output: Dict[str, Any]) -> bool:
+def validate(output: Dict[str, Any]) -> bool:
     """
-    Validate floating point output:
-    Checks that outputs are valid finite floats and positive sums.
+    x = x*a + b with a < 1 converges to the fixed point b/(1-a), which lies
+    in [0.1, 10] for the chosen ranges. FP32 and FP64 run the identical
+    recurrence, so their sums must agree closely; a large divergence means
+    the arithmetic went wrong.
     """
     if not isinstance(output, dict):
         return False
-    x32_sum = output.get("x32_sum")
-    y64_sum = output.get("y64_sum")
-
-    if x32_sum is None or y64_sum is None:
+    x32_sum, y64_sum = output.get("x32_sum"), output.get("y64_sum")
+    n = output.get("n")
+    if x32_sum is None or y64_sum is None or not n:
         return False
-    if np.isnan(x32_sum) or np.isinf(x32_sum):
+    for v in (x32_sum, y64_sum):
+        if not np.isfinite(v) or v <= 0:
+            return False
+    # FP32 and FP64 run the same recurrence, so their sums must agree closely.
+    rel_gap = abs(x32_sum - y64_sum) / max(abs(y64_sum), 1e-12)
+    if rel_gap >= 0.01:
         return False
-    if np.isnan(y64_sum) or np.isinf(y64_sum):
-        return False
-    if x32_sum <= 0 or y64_sum <= 0:
-        return False
-    return True
-
-
-def run_floating_point_subtest(target_duration: float = 1.0) -> SubtestResult:
-    return run_timed_subtest(
-        name="Floating-Point Compute (FP32/FP64 Ops)",
-        category="floating_point",
-        workload_profile="compute_bound",
-        raw_metric_name="MFLOPS",
-        workload_fn=floating_point_workload,
-        validate_fn=validate_floating_point_workload,
-        target_duration=target_duration,
-        min_reps=3,
-        max_reps=5
-    )
+    # Converged mean must land inside the analytic fixed-point range.
+    mean = y64_sum / n
+    return 0.05 < mean < 20.0

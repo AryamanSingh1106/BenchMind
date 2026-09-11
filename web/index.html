@@ -1,0 +1,595 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>BenchMind</title>
+<style>
+  :root {
+    --paper:      #eef1f4;
+    --grid:       #dce3ea;
+    --grid-major: #cfd9e2;
+    --ink:        #16222e;
+    --ink-soft:   #5a6b7a;
+    --ink-faint:  #8d9ba7;
+    --rule:       #c3cfda;
+    --plot-blue:  #124e78;
+    --plot-rust:  #a8461f;
+    --plot-green: #2f6b4f;
+    --plot-amber: #9a6b08;
+    --surface:    #f8fafb;
+
+    --sans: ui-sans-serif, "Segoe UI Variable Text", "Segoe UI", system-ui, -apple-system, sans-serif;
+    --mono: ui-monospace, "Cascadia Mono", "SF Mono", Menlo, Consolas, monospace;
+  }
+
+  * { box-sizing: border-box; }
+
+  body {
+    margin: 0;
+    font-family: var(--sans);
+    color: var(--ink);
+    background-color: var(--paper);
+    /* Graph paper. A benchmark result is plotted data; the ground says so. */
+    background-image:
+      linear-gradient(var(--grid) 1px, transparent 1px),
+      linear-gradient(90deg, var(--grid) 1px, transparent 1px),
+      linear-gradient(var(--grid-major) 1px, transparent 1px),
+      linear-gradient(90deg, var(--grid-major) 1px, transparent 1px);
+    background-size: 16px 16px, 16px 16px, 80px 80px, 80px 80px;
+    line-height: 1.5;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  .shell {
+    max-width: 1180px;
+    margin: 0 auto;
+    padding: 32px 24px 80px;
+  }
+
+  header.masthead {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: 20px;
+    border-bottom: 2px solid var(--ink);
+    padding-bottom: 10px;
+    margin-bottom: 28px;
+    flex-wrap: wrap;
+  }
+  .wordmark { font-size: 20px; font-weight: 650; letter-spacing: -0.01em; }
+  .wordmark span { font-weight: 400; color: var(--ink-soft); }
+  .machine { font-family: var(--mono); font-size: 12.5px; color: var(--ink-soft); text-align: right; }
+
+  .layout { display: grid; grid-template-columns: 296px 1fr; gap: 28px; align-items: start; }
+  @media (max-width: 900px) { .layout { grid-template-columns: 1fr; } }
+
+  /* ---- panels ---- */
+  .panel {
+    background: var(--surface);
+    border: 1px solid var(--rule);
+    padding: 18px 18px 20px;
+  }
+  .panel + .panel { margin-top: 20px; }
+  .panel h2 {
+    font-size: 13px; font-weight: 650; margin: 0 0 14px;
+    letter-spacing: 0.01em;
+  }
+  .panel h2 .aside { font-weight: 400; color: var(--ink-faint); }
+
+  /* ---- controls ---- */
+  label.field { display: block; font-size: 12.5px; color: var(--ink-soft); margin-bottom: 4px; }
+  select, button {
+    font-family: var(--sans); font-size: 14px;
+    border: 1px solid var(--rule); background: #fff; color: var(--ink);
+    padding: 8px 10px; width: 100%;
+  }
+  select { margin-bottom: 14px; }
+  button.run {
+    background: var(--ink); color: #fff; border-color: var(--ink);
+    font-weight: 600; cursor: pointer; padding: 11px;
+  }
+  button.run:hover:not(:disabled) { background: #0d1922; }
+  button.run:disabled { background: var(--ink-faint); border-color: var(--ink-faint); cursor: progress; }
+  button.run:focus-visible, select:focus-visible { outline: 2px solid var(--plot-blue); outline-offset: 2px; }
+  .check { display: flex; align-items: center; gap: 8px; font-size: 13px; margin-bottom: 9px; color: var(--ink-soft); }
+  .check input { width: auto; margin: 0; }
+
+  .progress-rail { height: 3px; background: var(--grid); margin-top: 14px; display: none; }
+  .progress-rail.on { display: block; }
+  .progress-rail i { display: block; height: 100%; background: var(--plot-blue); width: 0; transition: width .3s ease; }
+  .stage { font-family: var(--mono); font-size: 11.5px; color: var(--ink-soft); margin-top: 6px; min-height: 16px; }
+
+  /* ---- live readout ---- */
+  .live-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 10px 14px; margin-bottom: 12px; }
+  .live-cell .k { font-size: 11.5px; color: var(--ink-faint); }
+  .live-cell .v { font-family: var(--mono); font-size: 17px; font-variant-numeric: tabular-nums; }
+  canvas { display: block; width: 100%; border: 1px solid var(--rule); background: #fff; }
+
+  /* ---- hero: the score with its error bar ---- */
+  .readout { border: 1px solid var(--rule); background: var(--surface); padding: 26px 28px 22px; }
+  .readout .caption { font-size: 13px; color: var(--ink-soft); }
+  .readout .figure {
+    font-family: var(--mono); font-variant-numeric: tabular-nums;
+    font-size: clamp(52px, 11vw, 84px); line-height: 1; font-weight: 600;
+    letter-spacing: -0.03em; margin: 6px 0 2px;
+  }
+  .readout .interval { font-family: var(--mono); font-size: 14px; color: var(--plot-rust); }
+  .errorbar { margin: 20px 0 6px; }
+  .errorbar svg { display: block; width: 100%; height: 52px; overflow: visible; }
+  .readout .reference { font-size: 12.5px; color: var(--ink-faint); }
+
+  .split { display: grid; grid-template-columns: 1fr 1fr; gap: 18px; margin-top: 20px; }
+  @media (max-width: 620px) { .split { grid-template-columns: 1fr; } }
+  .stat { border-left: 3px solid var(--plot-blue); padding-left: 12px; }
+  .stat .k { font-size: 12px; color: var(--ink-soft); }
+  .stat .v { font-family: var(--mono); font-variant-numeric: tabular-nums; font-size: 26px; }
+  .stat .ci { font-family: var(--mono); font-size: 12px; color: var(--plot-rust); }
+
+  /* ---- category bars with whiskers ---- */
+  .cat { display: grid; grid-template-columns: 190px 1fr 108px; gap: 12px; align-items: center; padding: 7px 0; }
+  .cat + .cat { border-top: 1px solid var(--grid); }
+  .cat .name { font-size: 13px; }
+  .cat .name small { display: block; color: var(--ink-faint); font-size: 11px; }
+  .cat .track { position: relative; height: 22px; background: #fff; border: 1px solid var(--grid); }
+  .cat .fill { position: absolute; inset: 0 auto 0 0; background: var(--plot-blue); opacity: .82; }
+  .cat .fill.runtime { background: var(--ink-faint); }
+  .cat .whisker { position: absolute; top: 50%; height: 9px; border-left: 1px solid var(--plot-rust); border-right: 1px solid var(--plot-rust); border-top: 1px solid var(--plot-rust); transform: translateY(-50%); }
+  .cat .num { font-family: var(--mono); font-variant-numeric: tabular-nums; font-size: 13px; text-align: right; }
+  .ref-line { font-size: 11.5px; color: var(--ink-faint); margin-top: 10px; }
+
+  /* ---- findings ---- */
+  .finding { border-left: 3px solid var(--rule); padding: 2px 0 2px 14px; margin-bottom: 14px; font-size: 14px; }
+  .finding.alert { border-left-color: var(--plot-rust); }
+  .finding.ok { border-left-color: var(--plot-green); }
+  .finding.warn { border-left-color: var(--plot-amber); }
+  .finding .t { font-weight: 600; font-size: 12.5px; margin-bottom: 2px; }
+
+  .empty { color: var(--ink-soft); font-size: 14px; }
+  .hidden { display: none !important; }
+  table.runs { width: 100%; border-collapse: collapse; font-size: 13px; }
+  table.runs th { text-align: left; font-weight: 600; font-size: 11.5px; color: var(--ink-soft); border-bottom: 1px solid var(--rule); padding: 6px 8px 6px 0; }
+  table.runs td { padding: 6px 8px 6px 0; border-bottom: 1px solid var(--grid); font-family: var(--mono); font-variant-numeric: tabular-nums; }
+  table.runs td.txt { font-family: var(--sans); }
+
+  @media (prefers-reduced-motion: reduce) {
+    * { transition: none !important; }
+  }
+</style>
+</head>
+<body>
+<div class="shell">
+
+  <header class="masthead">
+    <div class="wordmark">BenchMind <span>hardware measurement</span></div>
+    <div class="machine" id="machine">reading system…</div>
+  </header>
+
+  <div class="layout">
+
+    <!-- ============ left rail ============ -->
+    <div>
+      <section class="panel">
+        <h2>Run a benchmark</h2>
+        <label class="field" for="mode">Depth</label>
+        <select id="mode">
+          <option value="quick">Quick — reduced scale, 3 reps</option>
+          <option value="standard" selected>Standard — full scale, 5 reps</option>
+          <option value="full">Full — full scale, 9 reps</option>
+        </select>
+        <div class="check"><input type="checkbox" id="gpu" checked><label for="gpu">Include GPU</label></div>
+        <div class="check"><input type="checkbox" id="scaling"><label for="scaling">Sweep thread counts</label></div>
+        <div class="check"><input type="checkbox" id="save" checked><label for="save">Save to history</label></div>
+        <button class="run" id="start">Start benchmark</button>
+        <div class="progress-rail" id="rail"><i id="bar"></i></div>
+        <div class="stage" id="stage"></div>
+      </section>
+
+      <section class="panel">
+        <h2>Live <span class="aside" id="tempsrc"></span></h2>
+        <div class="live-grid">
+          <div class="live-cell"><div class="k">CPU</div><div class="v" id="l-cpu">—</div></div>
+          <div class="live-cell"><div class="k">Memory</div><div class="v" id="l-ram">—</div></div>
+          <div class="live-cell"><div class="k">Package temp</div><div class="v" id="l-temp">—</div></div>
+          <div class="live-cell"><div class="k">Clock</div><div class="v" id="l-clock">—</div></div>
+        </div>
+        <canvas id="live" height="110"></canvas>
+      </section>
+
+      <section class="panel">
+        <h2>Conditions</h2>
+        <div id="conditions" class="empty">Checking…</div>
+      </section>
+    </div>
+
+    <!-- ============ main column ============ -->
+    <div>
+      <section class="readout" id="hero">
+        <div class="caption" id="hero-caption">No benchmark has run yet</div>
+        <div class="figure" id="hero-figure">——</div>
+        <div class="interval" id="hero-interval"></div>
+        <div class="errorbar" id="errorbar"></div>
+        <div class="reference" id="hero-reference">1000 points equals the BenchMind reference machine. The bar shows the 95% confidence interval: differences inside it are not measurable.</div>
+        <div class="split">
+          <div class="stat"><div class="k">Single core</div><div class="v" id="s-single">—</div><div class="ci" id="s-single-ci"></div></div>
+          <div class="stat"><div class="k">All cores</div><div class="v" id="s-multi">—</div><div class="ci" id="s-multi-ci"></div></div>
+        </div>
+      </section>
+
+      <section class="panel hidden" id="findings-panel">
+        <h2>What the run found</h2>
+        <div id="findings"></div>
+      </section>
+
+      <section class="panel hidden" id="cat-panel">
+        <h2>By workload <span class="aside">single thread</span></h2>
+        <div id="cats"></div>
+        <div class="ref-line">Whiskers mark the 95% confidence interval. Grey bars are runtime-bound and excluded from the index.</div>
+      </section>
+
+      <section class="panel hidden" id="thermal-panel">
+        <h2>Clock and temperature over the run</h2>
+        <canvas id="thermal" height="180"></canvas>
+        <div class="ref-line" id="thermal-note"></div>
+      </section>
+
+      <section class="panel hidden" id="scaling-panel">
+        <h2>Thread scaling</h2>
+        <canvas id="scalechart" height="180"></canvas>
+        <div class="ref-line" id="scaling-note"></div>
+      </section>
+
+      <section class="panel" id="history-panel">
+        <h2>History <span class="aside">same software stack only</span></h2>
+        <div id="history" class="empty">No earlier runs on this environment.</div>
+      </section>
+    </div>
+  </div>
+</div>
+
+<script>
+"use strict";
+
+const $ = (id) => document.getElementById(id);
+const fmt = (n, d = 0) => (n === null || n === undefined || isNaN(n)) ? "—"
+  : Number(n).toLocaleString(undefined, { minimumFractionDigits: d, maximumFractionDigits: d });
+
+// ---------------------------------------------------------------- live chart
+const liveSeries = { cpu: [], temp: [], clock: [] };
+const MAX_POINTS = 180;
+
+function pushLive(sample) {
+  liveSeries.cpu.push(sample.cpu ?? 0);
+  liveSeries.temp.push(sample.cpu_temp ?? null);
+  liveSeries.clock.push(sample.cpu_freq ?? null);
+  for (const k in liveSeries) if (liveSeries[k].length > MAX_POINTS) liveSeries[k].shift();
+}
+
+function setupCanvas(canvas) {
+  const dpr = window.devicePixelRatio || 1;
+  const rect = canvas.getBoundingClientRect();
+  canvas.width = rect.width * dpr;
+  canvas.height = canvas.clientHeight * dpr;
+  const ctx = canvas.getContext("2d");
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  return { ctx, w: rect.width, h: canvas.clientHeight };
+}
+
+function line(ctx, values, w, h, min, max, colour, dashed) {
+  const pts = values.map((v, i) => [i, v]).filter(p => p[1] !== null && p[1] !== undefined);
+  if (pts.length < 2) return;
+  ctx.save();
+  ctx.strokeStyle = colour;
+  ctx.lineWidth = 1.6;
+  if (dashed) ctx.setLineDash([4, 3]);
+  ctx.beginPath();
+  pts.forEach(([i, v], k) => {
+    const x = (i / Math.max(values.length - 1, 1)) * w;
+    const y = h - ((v - min) / Math.max(max - min, 1e-9)) * h;
+    k === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
+  });
+  ctx.stroke();
+  ctx.restore();
+}
+
+function drawLive() {
+  const canvas = $("live");
+  const { ctx, w, h } = setupCanvas(canvas);
+  ctx.clearRect(0, 0, w, h);
+  ctx.strokeStyle = "#e8edf2";
+  ctx.lineWidth = 1;
+  for (let g = 1; g < 4; g++) {
+    ctx.beginPath(); ctx.moveTo(0, h * g / 4); ctx.lineTo(w, h * g / 4); ctx.stroke();
+  }
+  line(ctx, liveSeries.cpu, w, h, 0, 100, "#124e78", false);
+  const temps = liveSeries.temp.filter(t => t !== null);
+  if (temps.length) line(ctx, liveSeries.temp, w, h, 20, 105, "#a8461f", true);
+}
+
+// ---------------------------------------------------------------- websocket
+function connectLive() {
+  const proto = location.protocol === "https:" ? "wss" : "ws";
+  const ws = new WebSocket(`${proto}://${location.host}/ws/live-monitor`);
+
+  ws.onmessage = (evt) => {
+    const d = JSON.parse(evt.data);
+    pushLive(d);
+    $("l-cpu").textContent = `${fmt(d.cpu, 1)}%`;
+    $("l-ram").textContent = `${fmt(d.ram, 1)}%`;
+    $("l-temp").textContent = d.cpu_temp === null ? "no sensor" : `${fmt(d.cpu_temp, 1)} °C`;
+    $("l-clock").textContent = d.cpu_freq === null ? "—" : `${fmt(d.cpu_freq, 0)} MHz`;
+    $("tempsrc").textContent = d.temp_source === "unavailable" ? "no temperature source" : d.temp_source;
+    drawLive();
+  };
+  ws.onclose = () => setTimeout(connectLive, 2500);
+}
+
+// ---------------------------------------------------------------- error bar
+function drawErrorBar(score, ciPct) {
+  if (!score) { $("errorbar").innerHTML = ""; return; }
+  const lo = score * (1 - ciPct / 100);
+  const hi = score * (1 + ciPct / 100);
+  // Scale runs from 0 to whichever is larger: 2x reference, or the score plus headroom.
+  const axisMax = Math.max(2000, hi * 1.18);
+  const pct = (v) => (v / axisMax) * 100;
+
+  $("errorbar").innerHTML = `
+    <svg viewBox="0 0 100 18" preserveAspectRatio="none" role="img"
+         aria-label="Score ${fmt(score)} with a 95% confidence interval from ${fmt(lo)} to ${fmt(hi)}">
+      <line x1="0" y1="12" x2="100" y2="12" stroke="#c3cfda" stroke-width="0.4"/>
+      <line x1="${pct(1000)}" y1="6" x2="${pct(1000)}" y2="18" stroke="#5a6b7a" stroke-width="0.4" stroke-dasharray="1.4 1.2"/>
+      <text x="${pct(1000)}" y="4.4" font-size="3.4" fill="#8d9ba7" text-anchor="middle"
+            font-family="ui-monospace, monospace">reference</text>
+      <line x1="${pct(lo)}" y1="12" x2="${pct(hi)}" y2="12" stroke="#a8461f" stroke-width="1"/>
+      <line x1="${pct(lo)}" y1="8.5" x2="${pct(lo)}" y2="15.5" stroke="#a8461f" stroke-width="0.7"/>
+      <line x1="${pct(hi)}" y1="8.5" x2="${pct(hi)}" y2="15.5" stroke="#a8461f" stroke-width="0.7"/>
+      <circle cx="${pct(score)}" cy="12" r="1.5" fill="#16222e"/>
+    </svg>`;
+}
+
+// ---------------------------------------------------------------- rendering
+function renderResult(d) {
+  const cpu = d.cpu || d.cpu_benchmark;
+  if (!cpu) return;
+
+  $("hero-caption").textContent = (d.summary && d.summary.rating) || "CPU Index";
+  $("hero-figure").textContent = fmt(cpu.cpu_index);
+  $("hero-interval").textContent = cpu.cpu_index_ci_pct
+    ? `± ${cpu.cpu_index_ci_pct.toFixed(1)}%  (95% CI, ${fmt(cpu.cpu_index * (1 - cpu.cpu_index_ci_pct / 100))}–${fmt(cpu.cpu_index * (1 + cpu.cpu_index_ci_pct / 100))})`
+    : "";
+  drawErrorBar(cpu.cpu_index, cpu.cpu_index_ci_pct || 0);
+
+  $("s-single").textContent = fmt(cpu.single_core_score);
+  $("s-single-ci").textContent = cpu.single_core_ci_pct ? `± ${cpu.single_core_ci_pct.toFixed(1)}%` : "";
+  $("s-multi").textContent = fmt(cpu.multi_core_score);
+  $("s-multi-ci").textContent = cpu.multi_core_ci_pct ? `± ${cpu.multi_core_ci_pct.toFixed(1)}%` : "";
+
+  renderFindings(d);
+  renderCategories(cpu.category_scores || {});
+  renderThermal(d);
+  renderScaling(d);
+}
+
+function renderFindings(d) {
+  const out = [];
+  const add = (cls, title, body) => body && out.push(
+    `<div class="finding ${cls}"><div class="t">${title}</div>${body}</div>`);
+
+  if (d.regression && d.regression.message) {
+    const v = d.regression.verdict;
+    add(v === "regression" ? "alert" : v === "improvement" ? "ok" : "", 
+        "Against your own history", d.regression.message);
+  }
+  if (d.throttling && d.throttling.summary) {
+    add(d.throttling.throttling_detected ? "alert" : "ok", "Sustained performance", d.throttling.summary);
+  }
+  if (d.bottleneck && d.bottleneck.summary) {
+    add("", "Where the limit is", d.bottleneck.summary);
+  }
+  if (d.scaling_analysis && d.scaling_analysis.summary) {
+    add("", "Thread scaling", d.scaling_analysis.summary);
+  }
+  if (d.summary && d.summary.warnings) {
+    d.summary.warnings.forEach(w => add("warn", "Caveat", w));
+  }
+  if (d.llm_report) {
+    add("", "Written analysis", d.llm_report.replace(/\n\n/g, "<br><br>"));
+  }
+
+  if (out.length) {
+    $("findings").innerHTML = out.join("");
+    $("findings-panel").classList.remove("hidden");
+  }
+}
+
+function renderCategories(cats) {
+  const entries = Object.entries(cats).filter(([, v]) => v && v.single_core > 0);
+  if (!entries.length) return;
+  const peak = Math.max(...entries.map(([, v]) => v.single_core * (1 + (v.single_core_ci_pct || 0) / 100)), 1000);
+
+  $("cats").innerHTML = entries.map(([key, v]) => {
+    const pct = (v.single_core / peak) * 100;
+    const ci = v.single_core_ci_pct || 0;
+    const lo = Math.max(0, (v.single_core * (1 - ci / 100) / peak) * 100);
+    const hi = Math.min(100, (v.single_core * (1 + ci / 100) / peak) * 100);
+    const label = key.replace(/_/g, " ");
+    return `<div class="cat">
+      <div class="name">${label}<small>${v.raw_metric_name || ""} ${fmt(v.single_core_raw, 1)}</small></div>
+      <div class="track">
+        <div class="fill ${v.counted_in_index ? "" : "runtime"}" style="width:${pct}%"></div>
+        ${ci ? `<div class="whisker" style="left:${lo}%;width:${Math.max(hi - lo, 0.6)}%"></div>` : ""}
+      </div>
+      <div class="num">${fmt(v.single_core)}</div>
+    </div>`;
+  }).join("");
+  $("cat-panel").classList.remove("hidden");
+}
+
+function renderThermal(d) {
+  const t = d.timeline;
+  if (!t || !t.elapsed || t.elapsed.length < 5) return;
+  const clocks = (t.cpu_freq || []).filter(v => v !== null);
+  const temps = (t.cpu_temp || []).filter(v => v !== null);
+  if (!clocks.length && !temps.length) return;
+
+  const canvas = $("thermal");
+  const { ctx, w, h } = setupCanvas(canvas);
+  ctx.clearRect(0, 0, w, h);
+  ctx.strokeStyle = "#e8edf2"; ctx.lineWidth = 1;
+  for (let g = 1; g < 4; g++) { ctx.beginPath(); ctx.moveTo(0, h * g / 4); ctx.lineTo(w, h * g / 4); ctx.stroke(); }
+
+  if (clocks.length) {
+    const lo = Math.min(...clocks) * 0.94, hi = Math.max(...clocks) * 1.03;
+    line(ctx, t.cpu_freq, w, h, lo, hi, "#124e78", false);
+  }
+  if (temps.length) line(ctx, t.cpu_temp, w, h, 20, 105, "#a8461f", true);
+
+  const th = d.throttling || {};
+  $("thermal-note").textContent =
+    `Solid line: clock speed. Dashed: package temperature. ` +
+    (th.onset_seconds ? `Clock first dropped at ${th.onset_seconds}s. ` : "") +
+    (th.peak_temp_c ? `Peak ${th.peak_temp_c} °C.` : "");
+  $("thermal-panel").classList.remove("hidden");
+}
+
+function renderScaling(d) {
+  const curve = d.scaling_curve;
+  if (!curve || !curve.points || curve.points.length < 2) return;
+
+  const canvas = $("scalechart");
+  const { ctx, w, h } = setupCanvas(canvas);
+  const pad = 30;
+  ctx.clearRect(0, 0, w, h);
+
+  const pts = curve.points;
+  const maxT = Math.max(...pts.map(p => p.threads));
+  const maxS = Math.max(maxT, ...pts.map(p => p.speedup));
+
+  const x = (t) => pad + (t / maxT) * (w - pad - 10);
+  const y = (s) => h - pad + 6 - (s / maxS) * (h - pad);
+
+  // Ideal linear scaling, for comparison.
+  ctx.strokeStyle = "#c3cfda"; ctx.setLineDash([4, 3]); ctx.lineWidth = 1;
+  ctx.beginPath(); ctx.moveTo(x(1), y(1)); ctx.lineTo(x(maxT), y(maxT)); ctx.stroke();
+  ctx.setLineDash([]);
+
+  ctx.strokeStyle = "#2f6b4f"; ctx.lineWidth = 1.8; ctx.beginPath();
+  pts.forEach((p, i) => i === 0 ? ctx.moveTo(x(p.threads), y(p.speedup)) : ctx.lineTo(x(p.threads), y(p.speedup)));
+  ctx.stroke();
+
+  ctx.fillStyle = "#16222e";
+  ctx.font = "11px ui-monospace, monospace";
+  pts.forEach(p => {
+    ctx.beginPath(); ctx.arc(x(p.threads), y(p.speedup), 3, 0, Math.PI * 2); ctx.fill();
+    ctx.fillText(`${p.threads}`, x(p.threads) - 3, h - 8);
+  });
+  ctx.fillStyle = "#8d9ba7";
+  ctx.fillText("threads", w / 2 - 20, h - 22);
+
+  $("scaling-note").textContent =
+    (d.scaling_analysis && d.scaling_analysis.summary) ||
+    `Dashed line is perfect linear scaling. Peak speedup ${curve.peak_speedup}x.`;
+  $("scaling-panel").classList.remove("hidden");
+}
+
+// ---------------------------------------------------------------- data calls
+async function loadSystem() {
+  const r = await (await fetch("/api/system-info")).json();
+  $("machine").innerHTML =
+    `${r.cpu}<br>${r.logical_cores} threads · ${r.ram} GB · ${r.os}<br>${r.environment_summary}`;
+}
+
+async function loadConditions() {
+  const v = await (await fetch("/api/validity?sample_seconds=1.0")).json();
+  const cls = v.verdict === "valid" ? "ok" : v.verdict === "tainted" ? "warn" : "alert";
+  const issues = (v.issues || []).map(i => `<div class="finding ${cls}">${i.message}</div>`).join("");
+  $("conditions").innerHTML = issues || 
+    `<div class="finding ok">Idle load ${fmt(v.background_cpu_pct, 1)}%, ${v.on_ac_power ? "on mains power" : "on battery"}. Ready to measure.</div>`;
+}
+
+async function loadHistory() {
+  const h = await (await fetch("/api/history?limit=12")).json();
+  if (!h.runs || !h.runs.length) return;
+  $("history").innerHTML = `<table class="runs">
+    <thead><tr><th>When</th><th>Mode</th><th>Index</th><th>Single</th><th>Multi</th><th>Peak °C</th><th>State</th></tr></thead>
+    <tbody>${h.runs.map(r => `<tr>
+      <td class="txt">${new Date(r.created_at * 1000).toLocaleString()}</td>
+      <td class="txt">${r.mode}</td>
+      <td>${fmt(r.cpu_index)}</td>
+      <td>${fmt(r.single_core_score)}</td>
+      <td>${fmt(r.multi_core_score)}</td>
+      <td>${r.peak_cpu_temp ? fmt(r.peak_cpu_temp, 1) : "—"}</td>
+      <td class="txt">${r.throttled ? "throttled" : r.validity_verdict}</td>
+    </tr>`).join("")}</tbody></table>`;
+}
+
+async function loadLatest() {
+  const d = await (await fetch("/api/dashboard")).json();
+  if (d.status === "finished") renderResult(d);
+}
+
+// ---------------------------------------------------------------- run flow
+async function startRun() {
+  const btn = $("start");
+  btn.disabled = true;
+  btn.textContent = "Running…";
+  $("rail").classList.add("on");
+
+  const body = {
+    mode: $("mode").value,
+    include_gpu: $("gpu").checked,
+    include_scaling: $("scaling").checked,
+    save_to_history: $("save").checked,
+  };
+
+  const res = await fetch("/api/benchmark", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(body),
+  });
+
+  if (!res.ok) {
+    const err = await res.json();
+    $("stage").textContent = err.detail || "Could not start.";
+    btn.disabled = false; btn.textContent = "Start benchmark";
+    return;
+  }
+
+  const { job_id } = await res.json();
+  const stream = new EventSource(`/api/jobs/${job_id}/events`);
+
+  stream.onmessage = async (evt) => {
+    const s = JSON.parse(evt.data);
+    $("bar").style.width = `${s.progress * 100}%`;
+    $("stage").textContent = s.stage.replace(/_/g, " ").replace(/:/g, " › ");
+
+    if (s.status === "finished" || s.status === "failed") {
+      stream.close();
+      btn.disabled = false;
+      btn.textContent = "Start benchmark";
+      $("rail").classList.remove("on");
+
+      if (s.status === "failed") {
+        $("stage").textContent = `Failed: ${s.error}`;
+        return;
+      }
+      $("stage").textContent = "";
+      const job = await (await fetch(`/api/jobs/${job_id}`)).json();
+      renderResult(job.result);
+      loadHistory();
+      loadConditions();
+    }
+  };
+}
+
+$("start").addEventListener("click", startRun);
+window.addEventListener("resize", drawLive);
+
+loadSystem();
+loadConditions();
+loadHistory();
+loadLatest();
+connectLive();
+</script>
+</body>
+</html>

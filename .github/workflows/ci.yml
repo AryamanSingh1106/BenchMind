@@ -1,0 +1,41 @@
+name: tests
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        python: ["3.10", "3.12"]
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+          cache: pip
+
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-dev.txt
+
+      - name: Run tests
+        # Correctness only. No assertion in this suite depends on how fast
+        # anything runs: GitHub runners are shared VMs whose timings vary by
+        # several times between runs, and timing assertions there produce
+        # flaky failures that train people to ignore the test suite.
+        # Speed and repeatability are verified by scripts/repeatability.py
+        # on real hardware.
+        run: python -m unittest discover -s tests -v
+
+      - name: Smoke test the benchmark pipeline
+        # Quick mode only, and the score is never checked -- this proves the
+        # pipeline runs end to end, not that the runner is fast.
+        run: python run.py bench --mode quick --no-gpu --no-save --force

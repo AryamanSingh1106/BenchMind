@@ -1,1 +1,1 @@
-# BenchMind CPU Benchmark Package
+"""BenchMind CPU benchmark package."""
