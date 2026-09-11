@@ -18,6 +18,19 @@ Changes in 2.0:
   clock fall while the temperature rises. Without it, throttle detection is
   guesswork.
 
+* THE CLOCK COMES FROM THE SENSOR SOURCE, NOT psutil (2.0.1).
+  `psutil.cpu_freq()` on Windows returns the nominal base clock from the
+  registry, a constant. On an i5-13450HX it reads 2400 MHz forever while the
+  chip ranges from 800 to 4600 MHz. Every snapshot therefore records
+  `clock_source`, and a psutil-derived clock on Windows is discarded rather
+  than stored, because a constant that looks like a measurement is worse than
+  an honest gap.
+
+* CPU PACKAGE POWER IS RECORDED WHERE AVAILABLE.
+  On laptops, power-limit throttling usually arrives before the clock visibly
+  collapses: PL1 steps down from the short-burst limit to the sustained one.
+  Package power is often the earliest throttle signal there is.
+
 * SAMPLING INTERVAL DRIFT IS MEASURED AND REPORTED.
   If the loop cannot keep up, the report says so rather than quietly producing
   an irregular timeline.
@@ -39,7 +52,7 @@ from typing import Any, Dict, List, Optional
 
 import psutil
 
-from monitoring.temp_reader import get_temperatures
+from monitoring.temp_reader import read_sensors
 
 logger = logging.getLogger("BenchMind.TelemetryService")
 
@@ -52,9 +65,12 @@ class TelemetrySnapshot:
     ram_utilization: float
     cpu_temp: Optional[float] = None
     gpu_temp: Optional[float] = None
-    cpu_freq: Optional[float] = None            # MHz, package average
+    cpu_freq: Optional[float] = None            # MHz, mean across performance cores
+    cpu_freq_max: Optional[float] = None        # MHz, fastest single core
+    cpu_power: Optional[float] = None           # W, package
     per_core_utilization: List[float] = field(default_factory=list)
     temp_source: str = "unavailable"
+    clock_source: str = "unavailable"
     gpu_utilization: Optional[float] = None
 
     def to_dict(self) -> Dict[str, Any]:
@@ -80,8 +96,11 @@ class TelemetryService:
         self._latest_snapshot: Optional[TelemetrySnapshot] = None
 
         # Shared temperature slot, written by the slow thread, read by the fast one.
-        self._temp_slot: Dict[str, Any] = {"cpu_temp": None, "gpu_temp": None,
-                                           "source": "unavailable"}
+        self._temp_slot: Dict[str, Any] = {
+            "cpu_temp": None, "gpu_temp": None, "cpu_clock_mhz": None,
+            "cpu_clock_max_mhz": None, "cpu_power_w": None,
+            "source": "unavailable", "clock_source": "unavailable",
+        }
         self._temp_lock = threading.Lock()
 
         self._interval_errors: deque = deque(maxlen=2000)
@@ -177,6 +196,8 @@ class TelemetryService:
             "cpu_temp": [s.cpu_temp for s in snaps],
             "gpu_temp": [s.gpu_temp for s in snaps],
             "cpu_freq": [s.cpu_freq for s in snaps],
+            "cpu_freq_max": [s.cpu_freq_max for s in snaps],
+            "cpu_power": [s.cpu_power for s in snaps],
             "time": [s.timestamp for s in snaps],
             "elapsed": [round(s.monotonic_time - base, 3) for s in snaps],
             "monotonic": [s.monotonic_time for s in snaps],
@@ -217,9 +238,9 @@ class TelemetryService:
                 if not self._running:
                     break
             try:
-                temps = get_temperatures()
+                sensors = read_sensors()
                 with self._temp_lock:
-                    self._temp_slot = temps
+                    self._temp_slot = sensors
             except Exception as e:  # noqa: BLE001
                 logger.debug("Temperature poll failed: %s", e)
             time.sleep(self.temp_interval)
@@ -245,27 +266,37 @@ class TelemetryService:
                             if self.per_core else [])
                 ram = psutil.virtual_memory().percent
 
-                freq_mhz = None
-                try:
-                    f = psutil.cpu_freq()
-                    if f and f.current:
-                        freq_mhz = round(float(f.current), 1)
-                except Exception:  # noqa: BLE001
-                    freq_mhz = None
-
                 with self._temp_lock:
-                    temps = dict(self._temp_slot)
+                    sensors = dict(self._temp_slot)
+
+                freq_mhz = sensors.get("cpu_clock_mhz")
+                freq_max = sensors.get("cpu_clock_max_mhz")
+                clock_source = sensors.get("clock_source", "unavailable")
+
+                if freq_mhz is None and not psutil.WINDOWS:
+                    # Linux exposes a live clock through psutil; Windows does
+                    # not, so no fallback is attempted there. See temp_reader.
+                    try:
+                        f = psutil.cpu_freq()
+                        if f and f.current:
+                            freq_mhz = round(float(f.current), 1)
+                            clock_source = "psutil"
+                    except Exception:  # noqa: BLE001
+                        freq_mhz = None
 
                 snapshot = TelemetrySnapshot(
                     timestamp=now_wall,
                     monotonic_time=now_mono,
                     cpu_utilization=cpu,
                     ram_utilization=ram,
-                    cpu_temp=temps.get("cpu_temp"),
-                    gpu_temp=temps.get("gpu_temp"),
+                    cpu_temp=sensors.get("cpu_temp"),
+                    gpu_temp=sensors.get("gpu_temp"),
                     cpu_freq=freq_mhz,
+                    cpu_freq_max=freq_max,
+                    cpu_power=sensors.get("cpu_power_w"),
                     per_core_utilization=per_core,
-                    temp_source=temps.get("source", "unavailable"),
+                    temp_source=sensors.get("source", "unavailable"),
+                    clock_source=clock_source,
                 )
 
                 with self._lock:

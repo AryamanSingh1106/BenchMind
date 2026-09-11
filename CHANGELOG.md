@@ -1,5 +1,76 @@
 # Changelog
 
+## 2.0.1
+
+Three fixes, all prompted by the same real run on a Lenovo i5-13450HX laptop
+(6 P-cores + 4 E-cores, 16 threads). The 2.0.0 report for that machine said:
+
+    Throttling detected (low confidence). Sustained 100.0% of opening clock
+    speed, package temperature rose 6.1 C to a peak of 88.0 C.
+
+That sentence contradicts itself, and tracking down why exposed three separate
+defects.
+
+### The clock signal was never real on Windows
+
+`psutil.cpu_freq()` reads the nominal base clock from the registry, not the
+live frequency. On the test machine it returned a constant 2400 MHz while the
+chip was actually ranging between 800 and 4600 MHz. Every throttle analysis
+ever run on Windows was reading a flat line.
+
+- Clocks now come from LibreHardwareMonitor's MSR readings, alongside the
+  temperatures already being polled there.
+- P-core and E-core clocks are collected separately. Averaging them would make
+  a shift in the work split between core types look exactly like throttling.
+- CPU package power is now recorded too. On a laptop, PL1 stepping down is
+  usually the earliest throttle signal, arriving before the clock visibly
+  collapses.
+- `clock_source` is recorded on every snapshot. On Windows a psutil-derived
+  clock is discarded rather than stored: a constant that looks like a
+  measurement is worse than an honest gap.
+- Sensor value parsing handles unit suffixes and thousands separators
+  (`4,192.5 MHz`, `45.3 W`, `62.0 °C`).
+
+### Throttle detection fired on temperature alone
+
+- A throttle verdict now **requires** a measured drop in clock or package
+  power. Temperature alone produces a note, never a verdict.
+- `HOT_TEMP_C` raised from 85 to 95. Mobile H- and HX-class parts routinely
+  sustain high 80s under all-core load by design; that is the cooling solution
+  at its operating point, not a fault.
+- A clock series with no variance is treated as **absent**, not as steady.
+- The report distinguishes thermal from power throttling, and distinguishes
+  "no throttling" from "could not be assessed".
+
+### Standard deviation cannot see drift
+
+Five runs on the test machine gave 2060, 2109, 2081, 1983, 1936. Standard
+deviation is 3.54%, which 2.0.0 called "GOOD" — but the scores fall
+monotonically after run 2, single-core drops 19% from best to worst, and peak
+temperature creeps upward. That is thermal soak across the session, not
+measurement noise, and 30 s of cooldown was not clearing it.
+
+- `detect_drift()` separates a systematic trend from scatter using
+  least-squares slope for magnitude and Spearman rank correlation against run
+  order for direction. Both must clear their threshold.
+- Upward drift is reported differently from downward: early slow runs usually
+  mean a warmup cost, late slow runs usually mean heat.
+- A drifting session is penalised in the repeatability score, however small
+  its standard deviation, and `repeat` prints the trend **before** the spread.
+- Default cooldown raised from 30 s to 90 s.
+
+### Elsewhere
+
+- The dashboard shows package power, labels a missing clock as "no clock
+  source", and refuses to plot a flat synthetic clock line.
+- `scripts/fetch_tools.py` tries the current release asset name first. The
+  hardcoded `net472` name was stale, and those older builds depend on the
+  WinRing0 driver that Windows now blocks by default under the vulnerable
+  driver blocklist — the failure mode is silent, with the app running normally
+  while every MSR sensor reads `-`.
+- 93 tests, up from 81. The new ones reproduce the exact false positive above
+  and assert the summary can never contradict itself.
+
 ## 2.0.0
 
 A methodology overhaul. **Scores from 1.x are not comparable to 2.0 scores.**

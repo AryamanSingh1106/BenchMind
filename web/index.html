@@ -192,6 +192,7 @@
           <div class="live-cell"><div class="k">Memory</div><div class="v" id="l-ram">—</div></div>
           <div class="live-cell"><div class="k">Package temp</div><div class="v" id="l-temp">—</div></div>
           <div class="live-cell"><div class="k">Clock</div><div class="v" id="l-clock">—</div></div>
+          <div class="live-cell"><div class="k">Package power</div><div class="v" id="l-power">—</div></div>
         </div>
         <canvas id="live" height="110"></canvas>
       </section>
@@ -317,7 +318,10 @@ function connectLive() {
     $("l-cpu").textContent = `${fmt(d.cpu, 1)}%`;
     $("l-ram").textContent = `${fmt(d.ram, 1)}%`;
     $("l-temp").textContent = d.cpu_temp === null ? "no sensor" : `${fmt(d.cpu_temp, 1)} °C`;
-    $("l-clock").textContent = d.cpu_freq === null ? "—" : `${fmt(d.cpu_freq, 0)} MHz`;
+    $("l-clock").textContent = d.cpu_freq === null
+      ? (d.clock_source === "unavailable" ? "no clock source" : "—")
+      : `${fmt(d.cpu_freq, 0)} MHz`;
+    $("l-power").textContent = d.cpu_power === null ? "—" : `${fmt(d.cpu_power, 1)} W`;
     $("tempsrc").textContent = d.temp_source === "unavailable" ? "no temperature source" : d.temp_source;
     drawLive();
   };
@@ -381,7 +385,17 @@ function renderFindings(d) {
         "Against your own history", d.regression.message);
   }
   if (d.throttling && d.throttling.summary) {
-    add(d.throttling.throttling_detected ? "alert" : "ok", "Sustained performance", d.throttling.summary);
+    const cls = d.throttling.throttling_detected ? "alert"
+      : d.throttling.confidence === "unmeasured" ? "warn" : "ok";
+    add(cls, "Sustained performance", d.throttling.summary);
+    (d.throttling.notes || []).forEach(n => add("warn", "Sensor note", n));
+  }
+  if (d.stability && d.stability.drift_verdict &&
+      d.stability.drift_verdict.startsWith("drift")) {
+    add("alert", "Trend across your recent runs",
+        `Scores have moved ${d.stability.drift_pct > 0 ? "up" : "down"} ` +
+        `${Math.abs(d.stability.drift_pct).toFixed(1)}% across the session. ` +
+        `That is a trend, not scatter.`);
   }
   if (d.bottleneck && d.bottleneck.summary) {
     add("", "Where the limit is", d.bottleneck.summary);
@@ -438,7 +452,9 @@ function renderThermal(d) {
   ctx.strokeStyle = "#e8edf2"; ctx.lineWidth = 1;
   for (let g = 1; g < 4; g++) { ctx.beginPath(); ctx.moveTo(0, h * g / 4); ctx.lineTo(w, h * g / 4); ctx.stroke(); }
 
-  if (clocks.length) {
+  const clockUsable = clocks.length > 8 &&
+    (Math.max(...clocks) - Math.min(...clocks)) / Math.max(...clocks) > 0.005;
+  if (clockUsable) {
     const lo = Math.min(...clocks) * 0.94, hi = Math.max(...clocks) * 1.03;
     line(ctx, t.cpu_freq, w, h, lo, hi, "#124e78", false);
   }
@@ -446,7 +462,8 @@ function renderThermal(d) {
 
   const th = d.throttling || {};
   $("thermal-note").textContent =
-    `Solid line: clock speed. Dashed: package temperature. ` +
+    (clockUsable ? "Solid line: clock speed. " : "No live clock source, so only temperature is plotted. ") +
+    `Dashed: package temperature. ` +
     (th.onset_seconds ? `Clock first dropped at ${th.onset_seconds}s. ` : "") +
     (th.peak_temp_c ? `Peak ${th.peak_temp_c} °C.` : "");
   $("thermal-panel").classList.remove("hidden");

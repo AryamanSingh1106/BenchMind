@@ -29,10 +29,19 @@ import zipfile
 from pathlib import Path
 from urllib.request import urlopen
 
-RELEASE_URL = (
-    "https://github.com/LibreHardwareMonitor/LibreHardwareMonitor/releases/"
-    "latest/download/LibreHardwareMonitor-net472.zip"
-)
+# The release asset name has changed across versions; try each in turn.
+# Older builds shipped as LibreHardwareMonitor-net472.zip and used the WinRing0
+# kernel driver, which Windows now blocks by default under the vulnerable
+# driver blocklist (CVE-2020-14979). On an affected machine the app launches
+# and performance counters work, but every clock, temperature and power sensor
+# reads as "-" because the driver never loaded. Newer builds replaced that
+# driver, so on Windows 11 the current release is the one you want.
+RELEASE_URLS = [
+    ("https://github.com/LibreHardwareMonitor/LibreHardwareMonitor/releases/"
+     "latest/download/LibreHardwareMonitor-net8.0-windows.zip"),
+    ("https://github.com/LibreHardwareMonitor/LibreHardwareMonitor/releases/"
+     "latest/download/LibreHardwareMonitor-net472.zip"),
+]
 TOOLS_DIR = Path(__file__).resolve().parent.parent / "tools" / "LibreHardwareMonitor"
 
 NOTICE = """LibreHardwareMonitor
@@ -43,12 +52,17 @@ BenchMind.
 Licensed under the Mozilla Public License 2.0.
 Source: https://github.com/LibreHardwareMonitor/LibreHardwareMonitor
 
-BenchMind reads temperatures from its optional HTTP server. To enable:
+BenchMind reads temperatures, per-core clocks and CPU package power from its
+optional HTTP server. To enable:
   1. Run LibreHardwareMonitor.exe as Administrator
   2. Options -> Remote Web Server -> Run  (default port 8085)
 
 Without it, BenchMind still runs; it reports "no temperature source" and
 skips thermal throttle analysis rather than inventing numbers.
+
+If every sensor shows "-" while the app is clearly running as Administrator,
+the kernel driver is being blocked. Either use a current release (which no
+longer relies on WinRing0) or check Core isolation -> Memory integrity.
 """
 
 
@@ -62,12 +76,20 @@ def fetch() -> int:
     TOOLS_DIR.mkdir(parents=True, exist_ok=True)
     print(f"Downloading LibreHardwareMonitor to {TOOLS_DIR} ...")
 
-    try:
-        with urlopen(RELEASE_URL, timeout=60) as response:
-            payload = response.read()
-    except Exception as e:  # noqa: BLE001
-        print(f"Download failed: {e}")
-        print(f"Download manually from:\n  {RELEASE_URL}\nand extract into {TOOLS_DIR}")
+    payload = None
+    for url in RELEASE_URLS:
+        try:
+            print(f"  trying {url.rsplit('/', 1)[-1]} ...")
+            with urlopen(url, timeout=60) as response:
+                payload = response.read()
+            break
+        except Exception as e:  # noqa: BLE001
+            print(f"    not available: {e}")
+
+    if payload is None:
+        print("\nDownload failed. Get the latest Windows release manually from:")
+        print("  https://github.com/LibreHardwareMonitor/LibreHardwareMonitor/releases")
+        print(f"and extract it into {TOOLS_DIR}")
         return 1
 
     with zipfile.ZipFile(io.BytesIO(payload)) as archive:

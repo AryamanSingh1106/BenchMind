@@ -10,7 +10,7 @@
 > - `docs/BENCHMARK_SPEC.md` — methodology, baselines, scoring (**the contract**)
 > - `CHANGELOG.md` — what changed and when
 
-Version 2.0.0
+Version 2.0.1
 
 ---
 
@@ -163,8 +163,14 @@ reintroduces the bug.
 8. **Never benchmark a CPU OpenCL runtime as a GPU.** Filter on
    `CL_DEVICE_TYPE_GPU`.
 9. **GPU timing uses OpenCL event profiling**, never host wall clock.
-10. **No blocking I/O in the telemetry sampler.** Temperature polling lives on
-    its own thread behind a circuit breaker.
+10. **No blocking I/O in the telemetry sampler.** Sensor polling lives on its
+    own thread behind a circuit breaker.
+10b. **Never use `psutil.cpu_freq()` for a live clock on Windows.** It returns
+    the registry's nominal base clock, a constant. Clocks come from
+    LibreHardwareMonitor. A flat series must be reported as absent, never as
+    steady.
+10c. **A throttle verdict requires a measured drop in clock or power.**
+    Temperature alone is corroborating evidence, never sufficient.
 11. **Never compare across fingerprints, modes or baseline versions.**
 12. **Importing anything must never require credentials.**
 13. **Never assert on timings in CI.** CI runners are noisy VMs; timing
@@ -184,7 +190,8 @@ placeholders**. Needs a run on real hardware and recalibration.
 **Telemetry** — decoupled temperature polling, frequency and per-core logging,
 sampling-health reporting.
 
-**Analysis** — throttle detection, roofline, scaling, stability, regression.
+**Analysis** — throttle detection (clock and power based), roofline, scaling,
+stability, drift-versus-scatter, regression.
 
 **API and UI** — job-based execution, SSE progress, WebSocket telemetry,
 single-file dashboard.
@@ -192,7 +199,7 @@ single-file dashboard.
 **Storage** — SQLite history with fingerprint-aware regression detection.
 Supabase optional.
 
-**Tests** — 81, all passing, none timing-dependent.
+**Tests** — 93, all passing, none timing-dependent.
 
 ---
 
@@ -208,6 +215,8 @@ Supabase optional.
 6. Storage benchmark.
 7. Native kernels (cffi or Numba) to reduce dependence on the Python stack.
 8. macOS temperature source.
+9. Per-core topology detection, so single-core pinning can target a known
+   P-core rather than logical core 0.
 
 Do not jump ahead unless explicitly asked.
 

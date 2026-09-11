@@ -32,6 +32,7 @@ from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnec
 from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
+from _version import __version__
 from ai.analysis import analyze_bottleneck, analyze_scaling, analyze_throttling
 from ai.stability_engine import build_stability_report
 from ai.summary_engine import generate_summary
@@ -66,7 +67,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="BenchMind",
-    version="2.0.0",
+    version=__version__,
     description="Hardware benchmarking and diagnostics suite.",
     lifespan=lifespan,
 )
@@ -94,7 +95,7 @@ class BenchmarkRequest(BaseModel):
 def root() -> Dict[str, Any]:
     return {
         "message": "BenchMind API Running",
-        "version": "2.0.0",
+        "version": __version__,
         "dashboard": "/dashboard",
         "docs": "/docs",
     }

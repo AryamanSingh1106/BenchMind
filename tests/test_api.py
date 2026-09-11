@@ -29,7 +29,10 @@ class TestAPI(unittest.TestCase):
         with TestClient(self.app) as client:
             r = client.get("/")
         self.assertEqual(r.status_code, 200)
-        self.assertEqual(r.json()["version"], "2.0.0")
+        # Asserted against the single source of truth, not a literal, so a
+        # version bump does not require editing the test.
+        from _version import __version__
+        self.assertEqual(r.json()["version"], __version__)
 
     def test_system_info_includes_fingerprint(self):
         with TestClient(self.app) as client:

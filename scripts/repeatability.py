@@ -26,7 +26,7 @@ from typing import Any, Dict, List
 
 
 def run_repeatability(runs: int = 3, mode: str = "standard",
-                      cooldown: float = 30.0) -> Dict[str, Any]:
+                      cooldown: float = 90.0) -> Dict[str, Any]:
     from ai.stability_engine import repeatability_from_scores
     from api.main import BenchmarkRequest, _execute_benchmark
     from monitoring.validity import check_run_validity
@@ -96,7 +96,25 @@ def run_repeatability(runs: int = 3, mode: str = "standard",
     print(f"  range           {report['min_score']:,.0f} to {report['max_score']:,.0f}")
 
     spread = report["spread_pct"]
-    if spread < 2:
+    drift = report.get("drift", {})
+
+    # Drift is reported before the spread, because a session that trends is a
+    # different problem from one that scatters, and standard deviation cannot
+    # tell them apart. A steady decline across five runs produces a modest
+    # standard deviation while meaning the machine changed under you.
+    print()
+    if drift.get("verdict") in ("drift_down", "drift_up"):
+        print(f"  TREND: {drift['total_change_pct']:+.1f}% across the session "
+              f"(rank correlation {drift['rank_correlation']:+.2f})")
+        print(f"  {drift['message']}")
+    elif drift.get("verdict") == "scatter":
+        print("  No systematic trend: the spread above is measurement scatter.")
+
+    if drift.get("verdict") == "drift_down":
+        verdict = "drifting"
+        note = ("Scores fell steadily. Fix that before trusting the spread figure: "
+                "increase --cooldown, or let the machine idle longer before starting.")
+    elif spread < 2:
         verdict, note = "excellent", "Differences under 2% between machines are still noise."
     elif spread < 5:
         verdict, note = "good", "Usable for coarse comparisons; treat sub-5% gaps as a tie."
@@ -115,6 +133,7 @@ def run_repeatability(runs: int = 3, mode: str = "standard",
     return {
         "runs": rows,
         "verdict": verdict,
+        "drift": drift,
         "spread_pct": spread,
         "mean_index": report["mean_score"],
         "single_core_spread_pct": repeatability_from_scores(singles).get("spread_pct"),
@@ -126,7 +145,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="BenchMind repeatability check.")
     parser.add_argument("--runs", type=int, default=3)
     parser.add_argument("--mode", choices=["quick", "standard", "full"], default="standard")
-    parser.add_argument("--cooldown", type=float, default=30.0)
+    parser.add_argument("--cooldown", type=float, default=90.0)
     args = parser.parse_args()
     result = run_repeatability(args.runs, args.mode, args.cooldown)
     return 0 if result["verdict"] in ("excellent", "good") else 1

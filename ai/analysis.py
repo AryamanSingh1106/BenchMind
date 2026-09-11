@@ -4,21 +4,32 @@ ai/analysis.py
 Two diagnostics that turn BenchMind from a score generator into something that
 answers a question.
 
-1. THERMAL THROTTLE DETECTION
-   BenchMind already logged temperature and timestamps; it just never looked at
-   them. This module splits the run window into quarters, compares throughput
-   and clock speed in the first quarter against the last, and correlates the
-   drop with the temperature rise. The output is a sentence like "sustained 87%
-   of opening throughput; clock fell 18% as package temperature rose 31 C from
-   61 C to 92 C, onset at 94 s".
+1. THERMAL AND POWER THROTTLE DETECTION
+   Splits the run window into quarters and compares opening against closing
+   clock speed and package power, correlated with the temperature rise.
+
+   Revised in 2.0.1 after a false positive on a mobile i5-13450HX. The 2.0.0
+   rules fired on peak temperature alone at a threshold of 85 C, and produced
+   the self-contradicting verdict:
+
+       "Throttling detected (low confidence). Sustained 100.0% of opening
+        clock speed, package temperature rose 6.1 C to a peak of 88.0 C."
+
+   Two things were wrong. A mobile HX part sitting at 88 C under sustained
+   all-core load is behaving normally, not throttling; and the clock series
+   came from psutil, which on Windows returns a constant, so "held 100%" meant
+   "we never had a clock signal" rather than "the clock held".
+
+   The rules now are:
+     * a throttle verdict REQUIRES a measured drop in clock or package power
+     * temperature alone never produces a verdict, only a note
+     * a clock series with no variance is treated as absent, not as steady
+     * the threshold is 95 C, and is relative to the part where known
 
 2. ROOFLINE / BOTTLENECK ANALYSIS
-   Every workload declares its arithmetic intensity (work per byte of memory
-   traffic) in the registry. Plotting achieved throughput against arithmetic
-   intensity tells you whether the machine ran out of compute or ran out of
-   memory bandwidth. That is the real payoff of the `workload_profile` field,
-   and it answers the question in BenchMind's own philosophy section:
-   "what kind of work is this hardware good at?"
+   Every workload declares its arithmetic intensity in the registry. Plotting
+   achieved throughput against arithmetic intensity says whether the machine
+   ran out of compute or ran out of memory bandwidth.
 """
 
 from __future__ import annotations
@@ -29,11 +40,20 @@ from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger("BenchMind.Analysis")
 
-# A clock drop this large between the start and end of a run is treated as
-# throttling rather than noise.
-CLOCK_DROP_THROTTLE_PCT = 5.0
-PERF_DROP_THROTTLE_PCT = 5.0
-HOT_TEMP_C = 85.0
+# A throttle verdict requires one of these to be exceeded. Temperature is
+# corroborating evidence only; it is never sufficient on its own.
+CLOCK_DROP_THROTTLE_PCT = 7.0
+POWER_DROP_THROTTLE_PCT = 12.0
+
+# Raised from 85. Mobile H- and HX-class parts routinely sustain high 80s
+# under all-core load by design; that is the cooling solution working at its
+# operating point, not a fault.
+HOT_TEMP_C = 95.0
+WARM_TEMP_C = 85.0
+
+# A clock series flatter than this is a nominal value being reported as if it
+# were live, not a genuinely steady clock. See monitoring/temp_reader.py.
+MIN_CLOCK_VARIATION_PCT = 0.5
 
 
 def _quartiles(values: List[Any]) -> List[List[Any]]:
@@ -44,113 +64,180 @@ def _quartiles(values: List[Any]) -> List[List[Any]]:
     return [clean[0:q], clean[q:2 * q], clean[2 * q:3 * q], clean[3 * q:]]
 
 
+def _series_is_usable(values: List[float]) -> bool:
+    """
+    A series with effectively no variance is not a measurement.
+
+    psutil on Windows reports the registry's nominal base clock, so every
+    sample is identical. Treating that as "the clock held steady" produced the
+    false positive this function now guards against.
+    """
+    clean = [v for v in values if v is not None]
+    if len(clean) < 8:
+        return False
+    mean = statistics.fmean(clean)
+    if mean <= 0:
+        return False
+    spread = (max(clean) - min(clean)) / mean * 100.0
+    return spread >= MIN_CLOCK_VARIATION_PCT
+
+
+def _quartile_drop(values: List[float]) -> Optional[Dict[str, Any]]:
+    """Opening versus closing quartile means, as a percentage drop."""
+    quarters = _quartiles(values)
+    if not quarters:
+        return None
+    means = [round(statistics.fmean(q), 1) for q in quarters]
+    opening, closing = means[0], means[-1]
+    if opening <= 0:
+        return None
+    return {
+        "quartile_means": means,
+        "opening": opening,
+        "closing": closing,
+        "drop_pct": round((opening - closing) / opening * 100.0, 2),
+    }
+
+
 def analyze_throttling(telemetry: Dict[str, List]) -> Dict[str, Any]:
     """
     Detect thermal or power throttling from a telemetry window.
 
-    Needs `cpu_freq` and ideally `cpu_temp`. Without a frequency source the
-    analysis degrades to temperature-only and says so instead of inventing a
-    verdict.
+    Requires a usable clock or package-power series. Without one it reports
+    that throttling could not be assessed, and says which source was missing,
+    rather than inferring a verdict from temperature.
     """
-    freqs = [f for f in telemetry.get("cpu_freq", []) if f is not None]
+    raw_freqs = telemetry.get("cpu_freq", []) or []
+    raw_power = telemetry.get("cpu_power", []) or []
+    freqs = [f for f in raw_freqs if f is not None]
+    powers = [p for p in raw_power if p is not None]
     temps = [t for t in telemetry.get("cpu_temp", []) if t is not None]
     elapsed = telemetry.get("elapsed", []) or []
+
+    clock_usable = _series_is_usable(freqs)
+    power_usable = _series_is_usable(powers)
 
     result: Dict[str, Any] = {
         "throttling_detected": False,
         "confidence": "none",
+        "mechanism": None,               # thermal | power | None
         "performance_retention_pct": None,
         "clock_drop_pct": None,
+        "power_drop_pct": None,
         "temp_rise_c": None,
         "peak_temp_c": max(temps) if temps else None,
         "onset_seconds": None,
         "frequency_source_available": bool(freqs),
+        "frequency_signal_usable": clock_usable,
+        "power_source_available": bool(powers),
         "temperature_source_available": bool(temps),
-        "summary": "",
         "quartile_clocks_mhz": [],
+        "quartile_power_w": [],
         "quartile_temps_c": [],
+        "summary": "",
+        "notes": [],
     }
 
-    if not freqs and not temps:
-        result["summary"] = (
-            "No frequency or temperature source available, so throttling could "
-            "not be assessed. On Windows, run LibreHardwareMonitor with its web "
-            "server enabled on port 8085."
+    if freqs and not clock_usable:
+        result["notes"].append(
+            "The clock series has no variance, which means it is a nominal value "
+            "rather than a live reading. On Windows that is psutil reporting the "
+            "registry base clock. Run LibreHardwareMonitor with its web server "
+            "enabled to get real per-core clocks."
         )
-        return result
 
-    freq_q = _quartiles(freqs)
-    temp_q = _quartiles(temps)
+    clock = _quartile_drop(freqs) if clock_usable else None
+    power = _quartile_drop(powers) if power_usable else None
+    temp = _quartile_drop(temps) if temps else None
 
-    if freq_q:
-        q_means = [round(statistics.fmean(q), 1) for q in freq_q]
-        result["quartile_clocks_mhz"] = q_means
-        opening, closing = q_means[0], q_means[-1]
-        if opening > 0:
-            drop = (opening - closing) / opening * 100.0
-            result["clock_drop_pct"] = round(drop, 2)
-            result["performance_retention_pct"] = round(100.0 - max(0.0, drop), 2)
+    if clock:
+        result["quartile_clocks_mhz"] = clock["quartile_means"]
+        result["clock_drop_pct"] = clock["drop_pct"]
+        result["performance_retention_pct"] = round(100.0 - max(0.0, clock["drop_pct"]), 2)
+    if power:
+        result["quartile_power_w"] = power["quartile_means"]
+        result["power_drop_pct"] = power["drop_pct"]
+    if temp:
+        result["quartile_temps_c"] = temp["quartile_means"]
+        result["temp_rise_c"] = round(temp["quartile_means"][-1] - temp["quartile_means"][0], 1)
 
-    if temp_q:
-        t_means = [round(statistics.fmean(q), 1) for q in temp_q]
-        result["quartile_temps_c"] = t_means
-        result["temp_rise_c"] = round(t_means[-1] - t_means[0], 1)
-
-    # Onset: first sample where the clock has fallen more than the threshold
-    # below the opening average and stays down.
-    if freqs and freq_q and elapsed and len(elapsed) == len(telemetry.get("cpu_freq", [])):
-        opening = statistics.fmean(freq_q[0])
-        threshold = opening * (1.0 - CLOCK_DROP_THROTTLE_PCT / 100.0)
-        for i, f in enumerate(telemetry.get("cpu_freq", [])):
-            if f is not None and f < threshold and i < len(elapsed):
+    # Onset: first sample where the clock falls below the opening quartile
+    # average by more than the threshold.
+    if clock and elapsed and len(elapsed) == len(raw_freqs):
+        threshold = clock["opening"] * (1.0 - CLOCK_DROP_THROTTLE_PCT / 100.0)
+        for i, f in enumerate(raw_freqs):
+            if f is not None and f < threshold:
                 result["onset_seconds"] = round(float(elapsed[i]), 1)
                 break
 
-    drop = result.get("clock_drop_pct") or 0.0
-    peak = result.get("peak_temp_c")
+    clock_drop = result["clock_drop_pct"] or 0.0
+    power_drop = result["power_drop_pct"] or 0.0
+    peak = result["peak_temp_c"]
 
-    if drop >= PERF_DROP_THROTTLE_PCT and peak is not None and peak >= HOT_TEMP_C:
+    clock_throttled = clock_drop >= CLOCK_DROP_THROTTLE_PCT
+    power_throttled = power_drop >= POWER_DROP_THROTTLE_PCT
+
+    if clock_throttled or power_throttled:
         result["throttling_detected"] = True
-        result["confidence"] = "high"
-    elif drop >= PERF_DROP_THROTTLE_PCT:
-        result["throttling_detected"] = True
-        result["confidence"] = "medium"
-    elif peak is not None and peak >= HOT_TEMP_C:
-        result["throttling_detected"] = True
-        result["confidence"] = "low"
+        result["mechanism"] = "thermal" if (peak is not None and peak >= WARM_TEMP_C) else "power"
+        if clock_throttled and power_throttled:
+            result["confidence"] = "high"
+        elif peak is not None and peak >= WARM_TEMP_C:
+            result["confidence"] = "high"
+        else:
+            result["confidence"] = "medium"
+    elif not clock_usable and not power_usable:
+        result["confidence"] = "unmeasured"
+
+    if peak is not None and peak >= HOT_TEMP_C and not result["throttling_detected"]:
+        result["notes"].append(
+            f"Peak package temperature reached {peak} C without a measurable drop "
+            "in clock or power. The cooling is at its limit but the chip is still "
+            "holding its operating point."
+        )
 
     result["summary"] = _throttle_summary(result)
     return result
 
 
 def _throttle_summary(r: Dict[str, Any]) -> str:
-    retention = r.get("performance_retention_pct")
-    drop = r.get("clock_drop_pct")
     peak = r.get("peak_temp_c")
     rise = r.get("temp_rise_c")
-    onset = r.get("onset_seconds")
 
-    if not r["throttling_detected"]:
-        if retention is not None:
-            base = f"No throttling detected. Clock held within {abs(drop or 0):.1f}% across the run"
-        else:
-            base = "No throttling detected"
+    if r["confidence"] == "unmeasured":
+        base = ("Throttling could not be assessed: no usable clock or package-power "
+                "signal was available")
         if peak is not None:
-            base += f", peaking at {peak} C"
+            base += f". Package temperature peaked at {peak} C"
         return base + "."
 
-    parts = []
-    if retention is not None:
-        parts.append(f"Sustained {retention}% of opening clock speed")
-    if drop:
-        parts.append(f"clock fell {drop}%")
-    if rise is not None and peak is not None:
-        parts.append(f"package temperature rose {rise} C to a peak of {peak} C")
-    if onset is not None:
-        parts.append(f"onset at {onset}s")
+    if not r["throttling_detected"]:
+        parts = []
+        if r.get("clock_drop_pct") is not None:
+            drop = r["clock_drop_pct"]
+            if drop > 0:
+                parts.append(f"clock held within {drop:.1f}% across the run")
+            else:
+                parts.append(f"clock rose {abs(drop):.1f}% across the run")
+        if r.get("power_drop_pct") is not None:
+            parts.append(f"package power within {abs(r['power_drop_pct']):.1f}%")
+        if peak is not None:
+            parts.append(f"peaking at {peak} C")
+        return "No throttling detected" + (": " + ", ".join(parts) if parts else "") + "."
 
-    confidence = r.get("confidence")
-    return (f"Throttling detected ({confidence} confidence). "
+    parts = []
+    retention = r.get("performance_retention_pct")
+    if retention is not None:
+        parts.append(f"sustained {retention}% of opening clock speed")
+    if r.get("power_drop_pct"):
+        parts.append(f"package power fell {r['power_drop_pct']:.1f}%")
+    if rise is not None and peak is not None:
+        parts.append(f"temperature rose {rise} C to a peak of {peak} C")
+    if r.get("onset_seconds") is not None:
+        parts.append(f"onset at {r['onset_seconds']}s")
+
+    mechanism = r.get("mechanism") or "unknown"
+    return (f"{mechanism.title()} throttling detected ({r['confidence']} confidence): "
             + ", ".join(parts) + ".")
 
 

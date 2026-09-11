@@ -89,11 +89,13 @@ class TestTelemetryService(unittest.TestCase):
         The 1.x bug: a blocking temperature call inside the sampling loop turned
         a 5 Hz sampler into a 1 Hz one whenever the sensor source was missing.
         """
-        def slow_temps():
+        def slow_sensors():
             time.sleep(0.5)
-            return {"cpu_temp": None, "gpu_temp": None, "source": "unavailable"}
+            return {"cpu_temp": None, "gpu_temp": None, "cpu_clock_mhz": None,
+                    "cpu_clock_max_mhz": None, "cpu_power_w": None,
+                    "source": "unavailable", "clock_source": "unavailable"}
 
-        with mock.patch("monitoring.telemetry_service.get_temperatures", slow_temps):
+        with mock.patch("monitoring.telemetry_service.read_sensors", slow_sensors):
             service = TelemetryService.get_instance(interval=0.05)
             service.start()
             time.sleep(1.0)
@@ -360,6 +362,197 @@ class TestAnalysis(unittest.TestCase):
         value = calculate_stability([50.0, 52.0, 48.0, 51.0])
         self.assertGreaterEqual(value, 0.0)
         self.assertLessEqual(value, 100.0)
+
+
+class TestClockSignalHandling(unittest.TestCase):
+    """
+    Regression tests for the 2.0.0 false positive on an i5-13450HX.
+
+    psutil on Windows returns the nominal base clock, so the clock series was a
+    constant. 2.0.0 read that as "clock held 100%" and then fired a throttle
+    verdict on temperature alone, producing a self-contradicting report.
+    """
+
+    def test_flat_clock_series_is_treated_as_absent(self):
+        from ai.analysis import analyze_throttling
+
+        # Exactly what psutil.cpu_freq() produces on Windows.
+        telemetry = {
+            "cpu_freq": [2400.0] * 40,
+            "cpu_temp": [60 + i * 0.7 for i in range(40)],
+            "cpu_power": [],
+            "elapsed": [i * 0.2 for i in range(40)],
+        }
+        result = analyze_throttling(telemetry)
+
+        self.assertFalse(result["frequency_signal_usable"])
+        self.assertFalse(result["throttling_detected"],
+                         "a constant clock must not produce a throttle verdict")
+        self.assertEqual(result["confidence"], "unmeasured")
+        self.assertTrue(any("no variance" in n for n in result["notes"]))
+
+    def test_hot_mobile_chip_without_clock_drop_is_not_throttling(self):
+        """88 C on a mobile HX part under all-core load is normal operation."""
+        from ai.analysis import analyze_throttling
+
+        telemetry = {
+            "cpu_freq": [3900 + (i % 5) * 20 for i in range(40)],
+            "cpu_temp": [82 + (i % 7) for i in range(40)],
+            "cpu_power": [],
+            "elapsed": [i * 0.2 for i in range(40)],
+        }
+        result = analyze_throttling(telemetry)
+        self.assertFalse(result["throttling_detected"])
+        self.assertIn("No throttling detected", result["summary"])
+
+    def test_real_clock_drop_is_detected(self):
+        from ai.analysis import analyze_throttling
+
+        clocks = [4300] * 10 + [4200] * 10 + [3500] * 10 + [3000] * 10
+        telemetry = {
+            "cpu_freq": clocks,
+            "cpu_temp": [60] * 10 + [75] * 10 + [88] * 10 + [96] * 10,
+            "cpu_power": [],
+            "elapsed": [i * 0.2 for i in range(40)],
+        }
+        result = analyze_throttling(telemetry)
+
+        self.assertTrue(result["throttling_detected"])
+        self.assertEqual(result["mechanism"], "thermal")
+        self.assertGreater(result["clock_drop_pct"], 20)
+        self.assertIsNotNone(result["onset_seconds"])
+
+    def test_power_limit_throttling_detected_without_clock(self):
+        """PL1 stepping down is often the earliest signal on a laptop."""
+        from ai.analysis import analyze_throttling
+
+        telemetry = {
+            "cpu_freq": [],
+            "cpu_power": [55] * 10 + [54] * 10 + [46] * 10 + [42] * 10,
+            "cpu_temp": [65] * 20 + [86] * 20,
+            "elapsed": [i * 0.2 for i in range(40)],
+        }
+        result = analyze_throttling(telemetry)
+
+        self.assertTrue(result["throttling_detected"])
+        self.assertGreater(result["power_drop_pct"], 12)
+
+    def test_summary_never_contradicts_itself(self):
+        """2.0.0 could say 'throttling detected' and 'sustained 100%' at once."""
+        from ai.analysis import analyze_throttling
+
+        telemetry = {
+            "cpu_freq": [2400.0] * 40,
+            "cpu_temp": [82 + (i % 8) for i in range(40)],
+            "cpu_power": [],
+            "elapsed": [i * 0.2 for i in range(40)],
+        }
+        summary = analyze_throttling(telemetry)["summary"]
+        self.assertFalse("throttling detected" in summary.lower()
+                         and "sustained 100" in summary.lower())
+
+
+class TestSensorParsing(unittest.TestCase):
+    def test_parses_localised_and_unit_suffixed_values(self):
+        from monitoring.temp_reader import _parse_number
+
+        self.assertEqual(_parse_number("62.0 \u00b0C"), 62.0)
+        self.assertEqual(_parse_number("4,192.5 MHz"), 4192.5)
+        self.assertEqual(_parse_number("45.3 W"), 45.3)
+        self.assertEqual(_parse_number(55.5), 55.5)
+        self.assertIsNone(_parse_number("n/a"))
+        self.assertIsNone(_parse_number(None))
+
+    def test_hybrid_core_clocks_are_separated(self):
+        """
+        P-cores and E-cores must not be averaged together. E-cores run several
+        hundred MHz slower by design, so a shift in the work split between them
+        would otherwise look exactly like throttling.
+        """
+        from unittest import mock
+        from monitoring import temp_reader
+
+        payload = {
+            "Text": "Sensor", "Children": [{
+                "Text": "CPU", "Children": [
+                    {"Text": "Clocks", "Children": [
+                        {"Text": "Bus Speed", "Type": "Clock", "Value": "100.0 MHz"},
+                        {"Text": "P-Core #1", "Type": "Clock", "Value": "4,200.0 MHz"},
+                        {"Text": "P-Core #2", "Type": "Clock", "Value": "4,000.0 MHz"},
+                        {"Text": "E-Core #1", "Type": "Clock", "Value": "3,000.0 MHz"},
+                    ]},
+                    {"Text": "Temperatures", "Children": [
+                        {"Text": "CPU Package", "Type": "Temperature", "Value": "88.0 \u00b0C"},
+                        {"Text": "P-Core #1", "Type": "Temperature", "Value": "90.0 \u00b0C"},
+                    ]},
+                    {"Text": "Powers", "Children": [
+                        {"Text": "CPU Package", "Type": "Power", "Value": "45.3 W"},
+                    ]},
+                ]}]}
+
+        temp_reader.reset_breaker()
+        fake = mock.Mock(status_code=200)
+        fake.json.return_value = payload
+        fake.raise_for_status.return_value = None
+
+        with mock.patch("requests.get", return_value=fake):
+            reading = temp_reader._read_librehardwaremonitor()
+
+        self.assertEqual(reading["cpu_temp"], 88.0)
+        self.assertEqual(reading["cpu_power_w"], 45.3)
+        self.assertEqual(reading["p_core_clock_mhz"], 4100.0)
+        self.assertEqual(reading["e_core_clock_mhz"], 3000.0)
+        # Headline clock is the P-core mean, and excludes Bus Speed entirely.
+        self.assertEqual(reading["cpu_clock_mhz"], 4100.0)
+        self.assertEqual(reading["clock_source"], "librehardwaremonitor")
+
+
+class TestDriftDetection(unittest.TestCase):
+    """
+    Standard deviation cannot tell a steady decline from random scatter, but
+    they mean completely different things.
+    """
+
+    def test_measured_thermal_soak_is_called_drift(self):
+        from ai.stability_engine import detect_drift
+
+        # Real data from an i5-13450HX, five runs with 30s cooldowns.
+        result = detect_drift([2060, 2109, 2081, 1983, 1936])
+
+        self.assertEqual(result["verdict"], "drift_down")
+        self.assertLess(result["total_change_pct"], -3.0)
+        self.assertLess(result["rank_correlation"], -0.6)
+
+    def test_scatter_is_not_called_drift(self):
+        from ai.stability_engine import detect_drift
+
+        result = detect_drift([2000, 2060, 1990, 2050, 2010])
+        self.assertEqual(result["verdict"], "scatter")
+
+    def test_warmup_drift_is_reported_upward(self):
+        from ai.stability_engine import detect_drift
+
+        result = detect_drift([1800, 1950, 2010, 2040, 2060])
+        self.assertEqual(result["verdict"], "drift_up")
+        self.assertIn("warmup", result["message"])
+
+    def test_too_few_runs_is_honest(self):
+        from ai.stability_engine import detect_drift
+        self.assertEqual(detect_drift([2000, 1900])["verdict"], "insufficient_runs")
+
+    def test_drift_penalises_repeatability_score(self):
+        """
+        A drifting session must not score well just because its standard
+        deviation is small.
+        """
+        from ai.stability_engine import repeatability_from_scores
+
+        drifting = repeatability_from_scores([2060, 2109, 2081, 1983, 1936])
+        scattered = repeatability_from_scores([2000, 2060, 1990, 2050, 2010])
+
+        self.assertEqual(drifting["drift"]["verdict"], "drift_down")
+        self.assertLess(drifting["score"], scattered["score"],
+                        "drift must be penalised harder than equivalent scatter")
 
 
 if __name__ == "__main__":

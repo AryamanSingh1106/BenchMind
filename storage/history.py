@@ -119,7 +119,7 @@ class HistoryStore:
 
         row = (
             time.time(),
-            env.get("benchmind_version", "2.0.0"),
+            env.get("benchmind_version", "unknown"),
             cpu.get("mode", "unknown"),
             env.get("fingerprint_hash", "unknown"),
             cpu.get("baseline_version"),

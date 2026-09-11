@@ -10,8 +10,13 @@ What makes it different from a score generator:
 - **A validity gate** checks background load, battery state, free memory and
   starting temperature before measuring, and marks the run `valid`, `tainted`
   or `invalid`.
-- **Thermal throttle detection** from clock and temperature telemetry:
-  "sustained 87% of opening clock, onset at 94 s, peak 96 °C".
+- **Thermal and power throttle detection** from real MSR clock, package power
+  and temperature: "sustained 87% of opening clock, onset at 94 s, peak 96 °C".
+  A verdict requires a measured drop, so a hot-but-healthy laptop is not
+  accused of throttling.
+- **Drift versus scatter**: five scores falling steadily is a different finding
+  from five scores bouncing around a mean, and BenchMind reports them
+  separately.
 - **Roofline analysis** classifies the machine as compute-limited or
   memory-bandwidth-limited by comparing cache-resident against DRAM-resident
   throughput.
@@ -124,7 +129,7 @@ Interactive docs at `/docs`.
 python -m unittest discover -s tests
 ```
 
-81 tests, none of them timing-dependent — CI runners are noisy shared VMs and
+93 tests, none of them timing-dependent — CI runners are noisy shared VMs and
 asserting on speed there produces flaky failures that teach people to ignore
 the suite. Speed is verified by `scripts/repeatability.py` on real hardware.
 

@@ -1,37 +1,58 @@
 """
 monitoring/temp_reader.py
 
-Hardware temperature source with a circuit breaker.
+Hardware sensor source with a circuit breaker.
 
-The 1.x version issued a blocking HTTP GET to LibreHardwareMonitor with a 1 s
-timeout on EVERY telemetry sample. The sampler runs at 5 Hz. If LHM was not
-running -- which is the normal case on a fresh machine, on Linux, and on macOS
--- every single sample could block for up to a second, so the "0.2 s interval"
-silently became an irregular multi-second interval and the telemetry timeline
-became garbage without anything visibly failing.
+Two jobs, both fed by the same HTTP poll of LibreHardwareMonitor:
 
-2.0 adds:
-  * a circuit breaker: after N consecutive failures the source is disabled for
-    a cool-off period instead of being retried 5 times a second
-  * a much shorter timeout
-  * psutil.sensors_temperatures() as a native fallback on Linux
-  * an explicit `source` field so the UI can say where the number came from
+  1. TEMPERATURES (as in 2.0.0)
+  2. CLOCK SPEED AND PACKAGE POWER (new in 2.0.1)
+
+Why clocks moved here from psutil
+---------------------------------
+On Windows, `psutil.cpu_freq()` reads the *nominal* base clock from the
+registry, not the live frequency. On an i5-13450HX it returns a constant
+2400 MHz forever, while the chip is actually running anywhere from 800 MHz to
+4600 MHz. Throttle detection built on that number is reading a flat line and
+can never fire.
+
+LibreHardwareMonitor reads the real per-core clocks from MSRs, and also
+reports CPU package power, which on a laptop is usually the *earlier* throttle
+signal: PL1 drops from its short-burst value to the sustained limit well
+before the clock visibly collapses.
+
+Sensor naming
+-------------
+Matching is deliberately tolerant, because sensor names differ across LHM
+versions and CPU generations:
+
+  hybrid Intel   "P-Core #1" ... "E-Core #4"
+  older Intel    "CPU Core #1"
+  AMD            "Core #1" / "CCD1 (Tdie)"
+
+Anything under Clocks that is not core-like (Bus Speed, Memory, GPU) is
+ignored.
 """
 
 from __future__ import annotations
 
 import logging
 import platform
+import re
 import threading
 import time
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger("BenchMind.TempReader")
 
 LHM_URL = "http://localhost:8085/data.json"
-REQUEST_TIMEOUT = 0.25          # was 1.0 -- far too long for a 5 Hz sampler
+REQUEST_TIMEOUT = 0.5
 FAILURES_BEFORE_TRIP = 3
 COOLDOWN_SECONDS = 30.0
+
+_P_CORE = re.compile(r"^p[- ]?core\s*#?\d+", re.I)
+_E_CORE = re.compile(r"^e[- ]?core\s*#?\d+", re.I)
+_GENERIC_CORE = re.compile(r"^(cpu\s+)?core\s*#?\d+", re.I)
 
 
 class _CircuitBreaker:
@@ -51,7 +72,7 @@ class _CircuitBreaker:
     def record_success(self) -> None:
         with self._lock:
             if self.failures:
-                logger.info("Temperature source recovered.")
+                logger.info("Sensor source recovered.")
             self.failures = 0
             self.open_until = 0.0
 
@@ -61,7 +82,7 @@ class _CircuitBreaker:
             if self.failures >= self.threshold and not self.open_until:
                 self.open_until = time.monotonic() + self.cooldown
                 logger.info(
-                    "Temperature source unavailable after %d attempts; "
+                    "Sensor source unavailable after %d attempts; "
                     "pausing probes for %.0fs.", self.failures, self.cooldown)
             elif self.open_until and time.monotonic() >= self.open_until:
                 self.open_until = time.monotonic() + self.cooldown
@@ -76,19 +97,50 @@ class _CircuitBreaker:
 _breaker = _CircuitBreaker(FAILURES_BEFORE_TRIP, COOLDOWN_SECONDS)
 
 
-def clean_temp(value: Any) -> Optional[float]:
-    """Convert '62.0 <degree>C' or 62.0 into a float, or None."""
+def _parse_number(value: Any) -> Optional[float]:
+    """
+    Pull a float out of an LHM value string.
+
+    LHM formats values with their unit attached and a locale-dependent decimal
+    separator: '62.0 <degree>C', '4,192.5 MHz', '45.3 W'. Strip everything that
+    is not part of the number.
+    """
     if value is None:
         return None
+    if isinstance(value, (int, float)):
+        return float(value)
     try:
-        text = str(value).replace("\u00b0C", "").replace("C", "").strip()
-        return float(text)
-    except (ValueError, TypeError, AttributeError) as e:
-        logger.debug("Could not parse temperature %r: %s", value, e)
+        text = str(value).strip()
+        match = re.search(r"-?\d[\d,]*\.?\d*", text)
+        if not match:
+            return None
+        return float(match.group(0).replace(",", ""))
+    except (ValueError, TypeError):
+        logger.debug("Could not parse sensor value %r", value)
         return None
 
 
-def _read_librehardwaremonitor() -> Optional[Dict[str, Optional[float]]]:
+def clean_temp(value: Any) -> Optional[float]:
+    """Backwards-compatible alias kept for 2.0.0 callers and tests."""
+    return _parse_number(value)
+
+
+def _empty_reading() -> Dict[str, Any]:
+    return {
+        "cpu_temp": None,
+        "gpu_temp": None,
+        "cpu_clock_mhz": None,       # mean across performance cores
+        "cpu_clock_max_mhz": None,   # fastest single core
+        "p_core_clock_mhz": None,
+        "e_core_clock_mhz": None,
+        "cpu_power_w": None,
+        "core_count_seen": 0,
+        "source": "unavailable",
+        "clock_source": "unavailable",
+    }
+
+
+def _read_librehardwaremonitor() -> Optional[Dict[str, Any]]:
     if not _breaker.allow():
         return None
     try:
@@ -106,27 +158,85 @@ def _read_librehardwaremonitor() -> Optional[Dict[str, Optional[float]]]:
         _breaker.record_failure()
         return None
 
-    temps: Dict[str, Optional[float]] = {"cpu_temp": None, "gpu_temp": None}
+    reading = _empty_reading()
+    p_clocks: List[float] = []
+    e_clocks: List[float] = []
+    generic_clocks: List[float] = []
+    fallback_temps: List[float] = []
 
     def scan(node):
         if not isinstance(node, dict):
             return
         for child in node.get("Children", []) or []:
             scan(child)
-        if node.get("Type") == "Temperature":
-            name = str(node.get("Text", "")).lower()
-            if "cpu package" in name and temps["cpu_temp"] is None:
-                temps["cpu_temp"] = clean_temp(node.get("Value"))
-            elif "gpu core" in name and temps["gpu_temp"] is None:
-                temps["gpu_temp"] = clean_temp(node.get("Value"))
+
+        stype = node.get("Type")
+        name = str(node.get("Text", "")).strip()
+        lowered = name.lower()
+
+        if stype == "Temperature":
+            value = _parse_number(node.get("Value"))
+            if value is None:
+                return
+            if "cpu package" in lowered and reading["cpu_temp"] is None:
+                reading["cpu_temp"] = value
+            elif ("gpu core" in lowered or "gpu hot spot" in lowered) \
+                    and reading["gpu_temp"] is None:
+                reading["gpu_temp"] = value
+            elif "core max" in lowered or "core average" in lowered or "tdie" in lowered:
+                fallback_temps.append(value)
+
+        elif stype == "Clock":
+            # Bus Speed, memory and GPU clocks are not CPU core clocks.
+            if not (_P_CORE.match(name) or _E_CORE.match(name)
+                    or _GENERIC_CORE.match(name)):
+                return
+            value = _parse_number(node.get("Value"))
+            if value is None or value <= 0:
+                return
+            if _P_CORE.match(name):
+                p_clocks.append(value)
+            elif _E_CORE.match(name):
+                e_clocks.append(value)
+            else:
+                generic_clocks.append(value)
+
+        elif stype == "Power":
+            if "cpu package" in lowered and reading["cpu_power_w"] is None:
+                reading["cpu_power_w"] = _parse_number(node.get("Value"))
 
     scan(data)
+
+    if reading["cpu_temp"] is None and fallback_temps:
+        reading["cpu_temp"] = max(fallback_temps)
+
+    if p_clocks:
+        reading["p_core_clock_mhz"] = round(sum(p_clocks) / len(p_clocks), 1)
+    if e_clocks:
+        reading["e_core_clock_mhz"] = round(sum(e_clocks) / len(e_clocks), 1)
+
+    # The headline clock is the performance-core mean. On a hybrid CPU the
+    # E-cores run several hundred MHz slower by design, so averaging all cores
+    # together would make a shift in the P/E work split look like throttling.
+    primary = p_clocks or generic_clocks or e_clocks
+    if primary:
+        reading["cpu_clock_mhz"] = round(sum(primary) / len(primary), 1)
+        reading["cpu_clock_max_mhz"] = round(max(primary), 1)
+        reading["core_count_seen"] = len(p_clocks) + len(e_clocks) + len(generic_clocks)
+        reading["clock_source"] = "librehardwaremonitor"
+
     _breaker.record_success()
-    return temps
+    return reading
 
 
-def _read_psutil_sensors() -> Optional[Dict[str, Optional[float]]]:
-    """Native fallback. Works on most Linux systems, not on Windows."""
+def _read_psutil_sensors() -> Optional[Dict[str, Any]]:
+    """
+    Native fallback. Works for temperatures on most Linux systems.
+
+    Deliberately does NOT supply a clock: psutil's frequency is the nominal
+    base clock on Windows and is useless for throttle detection. Reporting no
+    clock is better than reporting a constant that looks like a measurement.
+    """
     try:
         import psutil
         readings = psutil.sensors_temperatures()
@@ -135,32 +245,46 @@ def _read_psutil_sensors() -> Optional[Dict[str, Optional[float]]]:
     if not readings:
         return None
 
-    cpu_temp = None
-    gpu_temp = None
-    preferred = ("coretemp", "k10temp", "zenpower", "cpu_thermal", "acpitz")
-    for key in preferred:
+    result = _empty_reading()
+    for key in ("coretemp", "k10temp", "zenpower", "cpu_thermal", "acpitz"):
         if key in readings and readings[key]:
             entries = readings[key]
             pkg = next((e for e in entries if "package" in (e.label or "").lower()), None)
-            cpu_temp = float((pkg or entries[0]).current)
+            result["cpu_temp"] = float((pkg or entries[0]).current)
             break
     for key in ("amdgpu", "nouveau", "nvidia"):
         if key in readings and readings[key]:
-            gpu_temp = float(readings[key][0].current)
+            result["gpu_temp"] = float(readings[key][0].current)
             break
 
-    if cpu_temp is None and gpu_temp is None:
+    if result["cpu_temp"] is None and result["gpu_temp"] is None:
         return None
-    return {"cpu_temp": cpu_temp, "gpu_temp": gpu_temp}
+
+    # Linux exposes live per-core frequency through scaling_cur_freq, which
+    # psutil reads correctly. Windows does not, so gate on platform.
+    if platform.system() == "Linux":
+        try:
+            import psutil
+            per_core = psutil.cpu_freq(percpu=True)
+            live = [f.current for f in per_core if f and f.current]
+            if live:
+                result["cpu_clock_mhz"] = round(sum(live) / len(live), 1)
+                result["cpu_clock_max_mhz"] = round(max(live), 1)
+                result["core_count_seen"] = len(live)
+                result["clock_source"] = "psutil"
+        except Exception:  # noqa: BLE001
+            pass
+
+    return result
 
 
-def get_temperatures() -> Dict[str, Any]:
+def read_sensors() -> Dict[str, Any]:
     """
-    Return {'cpu_temp', 'gpu_temp', 'source'}.
+    Full sensor reading: temperatures, clocks and package power.
 
-    `source` is one of: 'librehardwaremonitor', 'psutil', 'unavailable'. The UI
-    shows it so a missing temperature reads as "no sensor source" rather than
-    as "your CPU is 0 degrees".
+    `source` and `clock_source` are reported separately, because temperature
+    may be available while a usable clock is not. The UI shows both so that a
+    missing clock reads as "no clock source" rather than as a flat line.
     """
     if platform.system() == "Windows":
         order = (_read_librehardwaremonitor, _read_psutil_sensors)
@@ -171,10 +295,26 @@ def get_temperatures() -> Dict[str, Any]:
 
     for reader, name in zip(order, names):
         result = reader()
-        if result and (result.get("cpu_temp") is not None or result.get("gpu_temp") is not None):
-            return {**result, "source": name}
+        if result and any(result.get(k) is not None
+                          for k in ("cpu_temp", "gpu_temp", "cpu_clock_mhz")):
+            result["source"] = name
+            return result
 
-    return {"cpu_temp": None, "gpu_temp": None, "source": "unavailable"}
+    return _empty_reading()
+
+
+def get_temperatures() -> Dict[str, Any]:
+    """
+    Backwards-compatible entry point returning just the temperature fields.
+
+    Prefer `read_sensors()`, which also carries clocks and package power.
+    """
+    reading = read_sensors()
+    return {
+        "cpu_temp": reading["cpu_temp"],
+        "gpu_temp": reading["gpu_temp"],
+        "source": reading["source"],
+    }
 
 
 def breaker_state() -> str:

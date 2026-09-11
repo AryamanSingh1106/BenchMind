@@ -254,8 +254,10 @@ def build_parser() -> argparse.ArgumentParser:
     repeat = sub.add_parser("repeat", help="Run several times and report repeatability.")
     repeat.add_argument("--runs", type=int, default=3)
     repeat.add_argument("--mode", choices=["quick", "standard", "full"], default="standard")
-    repeat.add_argument("--cooldown", type=float, default=30.0,
-                        help="Seconds of idle between runs so heat does not carry over.")
+    repeat.add_argument("--cooldown", type=float, default=90.0,
+                        help="Seconds of idle between runs so heat does not carry over. "
+                             "Raised from 30s in 2.0.1: on a thin laptop chassis 30s was "
+                             "not enough, and scores drifted down across the session.")
     repeat.set_defaults(func=cmd_repeat)
 
     history = sub.add_parser("history", help="Show stored runs.")

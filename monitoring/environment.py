@@ -31,6 +31,8 @@ import platform
 import sys
 from typing import Any, Dict, List, Optional
 
+from _version import __version__
+
 logger = logging.getLogger("BenchMind.Environment")
 
 _CACHE: Optional[Dict[str, Any]] = None
@@ -145,7 +147,7 @@ def get_environment_fingerprint(refresh: bool = False) -> Dict[str, Any]:
     numpy_info = _numpy_info()
 
     fingerprint: Dict[str, Any] = {
-        "benchmind_version": "2.0.0",
+        "benchmind_version": __version__,
         "python": {
             "version": platform.python_version(),
             "implementation": platform.python_implementation(),

@@ -237,11 +237,28 @@ unplugged, and the score can halve.
 ## 7. Derived analyses
 
 **Throttle detection** splits the telemetry window into quartiles and compares
-opening against closing clock speed, correlated with the temperature rise.
-Verdict confidence is `high` when both the clock fell ≥ 5% and the peak
-exceeded 85 °C, `medium` on clock alone, `low` on temperature alone. With no
-frequency or temperature source it reports that it could not assess, rather
-than reporting "no throttling".
+opening against closing clock speed and package power, correlated with the
+temperature rise.
+
+A verdict **requires a measured drop**: clock ≥ 7% or package power ≥ 12%.
+Temperature never produces a verdict on its own, only a note. Confidence is
+`high` when both clock and power fell, or when a clock drop coincides with a
+peak above 85 °C; `medium` otherwise; `unmeasured` when no usable signal
+existed.
+
+Two rules exist because of a specific false positive on a mobile i5-13450HX:
+
+* **A clock series with no variance is treated as absent.** `psutil.cpu_freq()`
+  on Windows returns the registry's nominal base clock, a constant. Reading
+  that as "the clock held steady" is how 2.0.0 produced the self-contradicting
+  verdict "throttling detected ... sustained 100% of opening clock speed".
+  Clocks come from LibreHardwareMonitor's MSR readings instead.
+* **The hot threshold is 95 °C, not 85.** Mobile H- and HX-class parts sustain
+  high 80s under all-core load by design.
+
+P-core and E-core clocks are collected separately and the headline figure is
+the performance-core mean, because averaging across core types would make a
+shift in the work split look like throttling.
 
 **Roofline / bottleneck** compares cache-resident against DRAM-resident FP
 throughput at one thread. Ratio ≥ 4 → memory-bandwidth limited; 2–4 → mixed;
@@ -252,6 +269,18 @@ throughput at one thread. Ratio ≥ 4 → memory-bandwidth limited; 2–4 → mi
 performance 35%, utilization steadiness 15%. The 1.x formula
 (`100 − std(cpu_utilization)`) is retained only as that last 15%, because a
 multi-phase benchmark is *supposed* to vary its CPU load.
+
+**Drift versus scatter.** Standard deviation cannot distinguish five scores
+falling steadily from five scores bouncing around a mean, but they mean
+different things: scatter says the measurement is imprecise, drift says the
+machine changed while you measured it. `detect_drift()` uses least-squares
+slope for magnitude and Spearman rank correlation against run order for
+direction, and calls a trend only when the total change ≥ 3% **and**
+|rho| ≥ 0.6. A drifting session is penalised in the repeatability score
+regardless of how tight its standard deviation is.
+
+Downward drift usually means heat is not clearing between runs; raise
+`--cooldown`. Upward drift usually means the first run paid a warmup cost.
 
 **Regression detection** compares against the median of the last 5 valid runs
 on the same fingerprint and mode. A change is only called significant when it
