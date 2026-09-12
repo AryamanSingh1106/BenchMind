@@ -51,39 +51,47 @@ logger = logging.getLogger("BenchMind.CPU.Common")
 # in docs/BENCHMARK_SPEC.md. These are NOT arbitrary round numbers chosen to
 # make results look nice -- if you recalibrate them, update the spec and the
 # CHANGELOG in the same commit.
-REFERENCE_MACHINE = "BenchMind Reference R1 (see docs/BENCHMARK_SPEC.md)"
+REFERENCE_MACHINE = "BenchMind Reference R2 (see docs/BENCHMARK_SPEC.md)"
 
 # Bumped in 2.1.0: the integer and floating_point working sets were resized to
 # fit inside a 2 MB L2 instead of straddling it, so their raw metrics are not
 # comparable to anything measured under 2.0.x.
 BASELINE_VERSION = "2.1.0"
 
+# Every number below is the median single-thread raw metric measured on
+# reference machine R2 -- a physical Lenovo laptop with an i5-13450HX -- over
+# five calibration passes, with the validity gate reporting 'valid'. The worst
+# spread across all eight categories was 1.68%; five were under 0.5%.
+#
+# R2 replaces R1, which was a shared cloud instance and therefore a poor
+# reference: noisy neighbours and unknown turbo behaviour. Full specification
+# and per-category spreads are in docs/BENCHMARK_SPEC.md.
+#
+# To recalibrate against your own reference, run:
+#     python -m scripts.calibrate_baselines --reps 5
+# The script refuses to emit a block whose spread exceeds 5%. Update this
+# table, BASELINE_VERSION, the spec and the CHANGELOG in one commit.
+CATEGORY_BASELINES: Dict[str, float] = {
+    "integer": 2106.52,        # Mops/sec  spread 0.74%
+    "floating_point": 5137.51,  # MFLOPS   spread 1.68%
+    "matrix": 46.88,           # GFLOPS    spread 0.16%
+    "vector_simd": 1.73,       # GFLOPS    spread 0.45%
+    "compression": 24.84,      # MB/s      spread 0.14%
+    "hashing": 849.14,         # MB/s      spread 0.28%
+    "branch_heavy": 32.30,     # Mops/sec  spread 0.74%
+    "interpreter": 45.06,      # Mops/sec  spread 0.49%
+}
+
 # Warmup runs until this much time has elapsed, not for a fixed rep count.
+# One repetition is enough for a 500 ms workload and useless for a 10 ms one:
+# a laptop CPU settles from peak turbo toward its sustained clock over
+# hundreds of milliseconds.
 WARMUP_MIN_SECONDS = 0.25
 WARMUP_MAX_REPS = 500
 
-# A repetition shorter than this cannot average out scheduling quanta and
-# clock transitions. Flagged, not silently accepted.
+# A repetition shorter than this cannot average out scheduling quanta,
+# interrupts or clock transitions. Flagged, not silently accepted.
 MIN_USEFUL_REP_SECONDS = 0.020
-
-# Every number below is the median single-thread raw metric actually measured
-# on reference machine R1, whose full specification and environment
-# fingerprint are recorded in docs/BENCHMARK_SPEC.md. They are not round
-# numbers picked to make scores look tidy.
-#
-# To recalibrate against your own reference, run:
-#     python scripts/calibrate_baselines.py
-# and update this block together with the spec and CHANGELOG in one commit.
-CATEGORY_BASELINES: Dict[str, float] = {
-    "integer": 3300.0,          # Mops/sec  - int64 SIMD ALU throughput
-    "floating_point": 3750.0,   # MFLOPS    - L2-resident FP32/FP64 FMA
-    "matrix": 65.0,             # GFLOPS    - single-thread BLAS dgemm
-    "vector_simd": 1.0,         # GFLOPS    - DRAM-bound streaming FMA
-    "compression": 22.5,        # MB/s      - zlib + bz2, mixed-entropy corpus
-    "hashing": 800.0,           # MB/s      - SHA-256 + BLAKE2b
-    "branch_heavy": 85.0,       # Mops/sec  - sort + binary search + gather
-    "interpreter": 45.0,        # Mops/sec  - pure CPython loop (excluded from index)
-}
 
 # Categories that measure the CPython interpreter rather than the hardware.
 # They are reported, but excluded from the composite index by default, because
@@ -404,7 +412,10 @@ def run_timed_subtest(
 
     score = calculate_subtest_score(spec.category, raw_metric_value) if validation_passed else 0.0
 
-    short_rep = median_time < MIN_USEFUL_REP_SECONDS
+    # Only meaningful at representative scale. A deliberately scaled-down run
+    # (quick mode, or a test using scale=0.02) has short repetitions by
+    # construction, and warning about it is noise rather than information.
+    short_rep = median_time < MIN_USEFUL_REP_SECONDS and scale >= 1.0
     if short_rep:
         logger.warning(
             "Subtest '%s' has a median repetition of %.1f ms, below the %.0f ms "

@@ -1,6 +1,6 @@
 # BenchMind Benchmark Specification
 
-Version 2.1.0 · baseline set `2.1.0`
+Version 2.1.1 · baseline set `2.1.0`
 
 This document is the contract for what a BenchMind score means. If you change
 a workload, a baseline, or a scoring rule, change this file in the same commit
@@ -33,10 +33,15 @@ Therefore every result carries an **environment fingerprint**
 compare runs whose `fingerprint_hash` differs.
 
 The fingerprint hashes: Python version and implementation, NumPy version, BLAS
-backend and version, OpenSSL, zlib, OS, CPU architecture, and any
-thread-count environment overrides. It deliberately excludes battery
-percentage, executable path and OS patch level, which vary without affecting
-comparability.
+backend and version, OpenSSL, zlib, OS, CPU architecture, any thread-count
+environment overrides, and **`BASELINE_VERSION`**.
+
+It deliberately excludes battery percentage, executable path, OS patch level,
+and **the BenchMind application version**. That last exclusion is deliberate
+and was a bug until 2.1.1: hashing the application version meant every
+release, including pure bug-fix releases that changed no workload, produced a
+new fingerprint and silently orphaned all stored history. What determines
+comparability is the baseline set, not the build.
 
 ---
 
@@ -161,41 +166,48 @@ quadrature sum of the weighted contributions.
 A subtest that fails validation scores 0 and is excluded from its composite. An
 unregistered category scores 0 rather than falling back to a default baseline.
 
-### 4.1 Reference machine R1
+### 4.1 Reference machine R2
 
-A score of 1000 means "matched R1 on that workload". R1's measured medians are
+A score of 1000 means "matched R2 on that workload". R2's measured medians are
 the baselines in `CATEGORY_BASELINES`.
 
 ```
-Machine    Intel Xeon @ 2.10 GHz, single vCPU cloud instance, 3.9 GB
-OS         Linux 6.18
-Python     3.12.3 (CPython)
-NumPy      2.4.4
-BLAS       OpenBLAS 0.3.31, limited to 1 thread
-Conditions validity gate 'valid', mains power, idle
+Machine    Lenovo laptop, 13th Gen Intel Core i5-13450HX
+           6 P-cores (SMT) + 4 E-cores, 16 threads, 15.71 GB
+OS         Windows 11
+Python     3.11.0 (CPython)
+NumPy      2.4.6
+BLAS       OpenBLAS 0.3.31.188.0, limited to 1 thread
+Pinning    logical core 10 (last P-core, away from core 0)
+Conditions validity gate 'valid', mains power, idle, 5 passes
 ```
 
-| Category | R1 median | Unit |
-|---|---|---|
-| integer | 3300.0 | Mops/sec |
-| floating_point | 3750.0 | MFLOPS |
-| matrix | 65.0 | GFLOPS |
-| vector_simd | 1.0 | GFLOPS |
-| compression | 22.5 | MB/s |
-| hashing | 800.0 | MB/s |
-| branch_heavy | 85.0 | Mops/sec |
-| interpreter | 45.0 | Mops/sec |
+| Category | R2 median | Unit | Spread |
+|---|---|---|---|
+| integer | 2106.52 | Mops/sec | 0.74% |
+| floating_point | 5137.51 | MFLOPS | 1.68% |
+| matrix | 46.88 | GFLOPS | 0.16% |
+| vector_simd | 1.73 | GFLOPS | 0.45% |
+| compression | 24.84 | MB/s | 0.14% |
+| hashing | 849.14 | MB/s | 0.28% |
+| branch_heavy | 32.30 | Mops/sec | 0.74% |
+| interpreter | 45.06 | Mops/sec | 0.49% |
 
-**R1 is provisional.** It is a cloud instance, which is a poor reference: noisy
-neighbours and unknown turbo behaviour. Replace it with a physical machine you
-control as soon as you have one, using:
+**Why R2 replaced R1.** R1 was a shared cloud instance: noisy neighbours,
+unknown turbo behaviour, and no way to control its conditions. R2 is physical
+hardware whose state can be verified before a calibration pass.
 
-```
-python -m scripts.calibrate_baselines --reps 5
-```
+**The spreads are the point.** Every category is under 1.7% and five are under
+0.5%, which is what makes these baselines usable. The same machine's first
+calibration attempt, before the 2.0.2 and 2.1.0 measurement fixes, produced
+36.92% on `integer` — and adopting that would have permanently miscalibrated
+the category while looking perfectly authoritative. The journey from 36.92% to
+0.74% is recorded in the CHANGELOG for 2.0.2 and 2.1.0.
 
-Then bump `BASELINE_VERSION`, update this section, and note it in the
-CHANGELOG — in one commit. Scores across baseline versions are not comparable.
+R2 is a laptop, which has one genuine drawback as a reference: it is thermally
+constrained, and repeated back-to-back runs drift downward as the chassis
+soaks up heat (see the drift detection in section 7). Calibration must be run
+from cold.
 
 ### 4.2 The calibration spread gate
 
@@ -343,4 +355,4 @@ Recorded honestly rather than hidden:
    may be scheduled onto it, sharing execution resources with the measurement.
    Reported, not solved.
 4. **No RAM latency, storage, or network benchmark** yet.
-5. **R1 and the GPU baselines are provisional.**
+5. **The GPU baselines are still untested placeholders.** They have never been measured on real hardware; run the suite on a real GPU and recalibrate before treating GPU scores as meaningful.

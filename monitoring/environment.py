@@ -35,6 +35,15 @@ from _version import __version__
 
 logger = logging.getLogger("BenchMind.Environment")
 
+
+def _baseline_version() -> str:
+    """Imported lazily to avoid a cycle: common.py imports nothing from here."""
+    try:
+        from benchmarks.cpu.common import BASELINE_VERSION
+        return BASELINE_VERSION
+    except Exception:  # noqa: BLE001
+        return "unknown"
+
 _CACHE: Optional[Dict[str, Any]] = None
 
 
@@ -148,6 +157,9 @@ def get_environment_fingerprint(refresh: bool = False) -> Dict[str, Any]:
 
     fingerprint: Dict[str, Any] = {
         "benchmind_version": __version__,
+        # Scoring baselines. This, not the application version, is what decides
+        # whether two runs can be compared.
+        "baseline_version": _baseline_version(),
         "python": {
             "version": platform.python_version(),
             "implementation": platform.python_implementation(),
@@ -191,6 +203,18 @@ def compute_fingerprint_hash(fingerprint: Dict[str, Any]) -> str:
     version, OpenSSL, zlib, CPU architecture, and whether thread-count
     environment overrides are set.
     """
+    # NOTE: this hashes BASELINE_VERSION, not the application version.
+    #
+    # Through 2.1.0 it hashed `benchmind_version`, which meant every release --
+    # including a pure bug-fix release that changed no workload -- produced a
+    # new fingerprint and silently orphaned all stored history. A real user hit
+    # this going from 2.0.2 to 2.1.0 and watched their run history stop being
+    # comparable.
+    #
+    # What actually determines comparability is the scoring baseline set. Two
+    # builds sharing a BASELINE_VERSION measure the same thing and their scores
+    # are directly comparable; a baseline change genuinely does invalidate
+    # comparisons, and that is the only case where history should break.
     comparable = {
         "python": fingerprint.get("python", {}).get("version"),
         "implementation": fingerprint.get("python", {}).get("implementation"),
@@ -204,7 +228,7 @@ def compute_fingerprint_hash(fingerprint: Dict[str, Any]) -> str:
         "openssl": fingerprint.get("openssl"),
         "zlib": fingerprint.get("zlib"),
         "thread_vars": fingerprint.get("env_thread_vars", {}),
-        "benchmind_version": fingerprint.get("benchmind_version"),
+        "baseline_version": fingerprint.get("baseline_version"),
     }
     blob = json.dumps(comparable, sort_keys=True, default=str).encode("utf-8")
     return hashlib.sha256(blob).hexdigest()[:16]

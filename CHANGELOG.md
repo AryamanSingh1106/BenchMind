@@ -1,5 +1,61 @@
 # Changelog
 
+## 2.1.1
+
+Baseline set unchanged (`2.1.0`); scores remain comparable to 2.1.0.
+
+### Reference machine replaced: R1 -> R2
+
+The 2.1.0 measurement fixes brought a real i5-13450HX laptop from a 36.92%
+worst-case calibration spread down to 1.68%, with five of eight categories
+under 0.5%. That machine now becomes reference R2, replacing the shared cloud
+instance used for R1.
+
+    integer         2106.52 Mops/sec   spread 0.74%
+    floating_point  5137.51 MFLOPS     spread 1.68%
+    matrix            46.88 GFLOPS     spread 0.16%
+    vector_simd        1.73 GFLOPS     spread 0.45%
+    compression       24.84 MB/s       spread 0.14%
+    hashing          849.14 MB/s       spread 0.28%
+    branch_heavy      32.30 Mops/sec   spread 0.74%
+    interpreter       45.06 Mops/sec   spread 0.49%
+
+R1 was a cloud instance with noisy neighbours and unverifiable conditions. R2
+is physical hardware whose state can be checked before a pass. Full
+specification in docs/BENCHMARK_SPEC.md section 4.1.
+
+Note that `floating_point` also rose from 3,599 to 5,137 MFLOPS between 2.0.2
+and 2.1.0 on the same machine. That is not measurement noise: the workload was
+previously sized at 2.25 MB against a 2 MB L2, so it was partly DRAM-bound.
+Fixing the size made it genuinely faster as well as far more stable.
+
+### The fingerprint no longer hashes the application version
+
+`compute_fingerprint_hash()` included `benchmind_version`, so **every release
+produced a new fingerprint and silently orphaned all stored run history** —
+even a pure bug-fix release that changed no workload. This was hit in practice
+going 2.0.2 -> 2.1.0.
+
+It now hashes `BASELINE_VERSION` instead. Two builds sharing a baseline set
+measure the same thing and their scores are comparable; a baseline change
+genuinely does invalidate comparisons, and that is now the only case where
+history breaks.
+
+### Test bug: BLAS threads were unrestricted
+
+`test_real_workloads_have_useful_repetition_lengths` did not limit BLAS
+threads, so `matrix` ran multithreaded — about 264 GFLOPS on a 16-thread
+machine against 47 GFLOPS single-threaded. The repetition came in at 10 ms and
+the test failed against a configuration the suite never uses. It now wraps in
+`threadpool_limits(1, "blas")`, matching `single_core.py`, and also covers
+`vector_simd`.
+
+### Elsewhere
+
+- The short-repetition warning now only fires at `scale >= 1.0`. A
+  deliberately scaled-down run has short repetitions by construction, so
+  warning about it was noise; the test logs were full of it.
+
 ## 2.1.0
 
 **Baseline version bumped to `2.1.0`. Scores are not comparable to 2.0.x.**

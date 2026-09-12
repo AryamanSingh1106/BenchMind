@@ -10,7 +10,7 @@
 > - `docs/BENCHMARK_SPEC.md` — methodology, baselines, scoring (**the contract**)
 > - `CHANGELOG.md` — what changed and when
 
-Version 2.1.0
+Version 2.1.1
 
 ---
 
@@ -191,9 +191,10 @@ reintroduces the bug.
 
 ## 7. Current status
 
-**CPU** — complete. Eight workloads, setup/run split, confidence intervals,
-core pinning, warm pool, shared registry, aligned single/multi work, thread
-scaling curve.
+**CPU** — complete and calibrated. Eight workloads, setup/run split,
+confidence intervals, topology-aware core pinning, warm pool, shared registry,
+aligned single/multi work, thread scaling curve. Reference R2 measured with
+every category under 1.7% spread.
 
 **GPU** — rewritten and structurally sound, but **the baselines are untested
 placeholders**. Needs a run on real hardware and recalibration.
@@ -216,10 +217,9 @@ Supabase optional.
 
 ## 8. Current priority
 
-1. Run `python -m scripts.calibrate_baselines --reps 5` on a real physical
-   machine, on mains power and starting cold, and replace reference R1. Every
-   category must clear the 5% spread gate.
-2. Run `python run.py repeat --runs 5` and confirm spread is under 2%.
+1. **Done.** Reference R2 calibrated on physical hardware; worst spread 1.68%.
+2. Run `python run.py repeat --runs 5` and confirm spread is under 2%. Expect
+   downward drift on a laptop; raise `--cooldown` if it appears.
 3. Run the GPU suite on the RTX 3050 and calibrate the GPU baselines.
 4. Freeze the CPU implementation; bump `BASELINE_VERSION` on any change after
    that point.

@@ -255,20 +255,28 @@ class TestTimedRunner(unittest.TestCase):
     def test_real_workloads_have_useful_repetition_lengths(self):
         """
         Every shipped workload must have repetitions above the stability floor.
-        This is the test that would have caught integer and floating_point
-        sitting at ~10-20 ms, where their spread was 15% and 7%.
+        This is the test that caught integer and floating_point sitting at
+        ~13 ms after their working sets were halved.
+
+        BLAS must be limited to one thread here, exactly as single_core.py does
+        it. Without that, `matrix` runs multithreaded: on a 16-thread machine it
+        reached ~264 GFLOPS against 47 GFLOPS single-threaded, so the
+        repetition came in at 10 ms and the test failed on a configuration the
+        suite never actually uses.
         """
+        import threadpoolctl
         from benchmarks.cpu.common import MIN_USEFUL_REP_SECONDS
 
-        for key in ("integer", "floating_point", "matrix"):
-            with self.subTest(workload=key):
-                spec = registry.get(key)
-                result = run_timed_subtest(spec, scale=1.0, target_duration=0.3,
-                                           min_reps=3, max_reps=4)
-                self.assertTrue(result.validation_passed)
-                self.assertGreaterEqual(
-                    result.median_time, MIN_USEFUL_REP_SECONDS * 0.75,
-                    f"{key} repetitions are too short to measure stably")
+        with threadpoolctl.threadpool_limits(limits=1, user_api="blas"):
+            for key in ("integer", "floating_point", "matrix", "vector_simd"):
+                with self.subTest(workload=key):
+                    spec = registry.get(key)
+                    result = run_timed_subtest(spec, scale=1.0, target_duration=0.3,
+                                               min_reps=3, max_reps=4)
+                    self.assertTrue(result.validation_passed)
+                    self.assertGreaterEqual(
+                        result.median_time, MIN_USEFUL_REP_SECONDS * 0.75,
+                        f"{key} repetitions are too short to measure stably")
 
     def test_reports_confidence_interval(self):
         spec = registry.get("integer")
