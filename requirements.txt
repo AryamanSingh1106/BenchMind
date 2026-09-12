@@ -19,5 +19,7 @@ python-dotenv>=1.0
 # supabase>=2.0
 
 # --- optional: GPU benchmarking (benchmarks/gpu/) ---
-# Needs a vendor OpenCL runtime installed as well.
+# Verified against pyopencl 2026.1.4 on Windows with the NVIDIA CUDA and Intel
+# Graphics OpenCL runtimes. Vendor runtimes ship with the GPU driver, so
+# normally nothing else is needed.
 # pyopencl>=2023.1

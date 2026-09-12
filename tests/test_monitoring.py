@@ -350,6 +350,98 @@ class TestHistoryValidityFiltering(unittest.TestCase):
         self.assertLess(clean["spread_pct"], 2.0)
 
 
+class TestGpuSuiteWithoutGpu(unittest.TestCase):
+    """
+    The GPU path must degrade honestly on a machine with no OpenCL device,
+    which is the normal state in CI and on any machine without a vendor
+    runtime installed.
+    """
+
+    def test_suite_reports_why_it_is_unavailable(self):
+        from benchmarks.gpu.gpu_suite import run_gpu_suite
+        from benchmarks.gpu.devices import opencl_available
+
+        result = run_gpu_suite()
+        self.assertIn(result["status"], ("ok", "unavailable", "no_gpu_found"))
+        if result["status"] != "ok":
+            self.assertTrue(result["reason"],
+                            "an unavailable GPU must explain itself")
+            self.assertEqual(result["devices"], [])
+        if not opencl_available():
+            self.assertEqual(result["status"], "unavailable")
+
+    def test_calibration_refuses_without_a_gpu(self):
+        from benchmarks.gpu.gpu_suite import calibrate_gpu
+
+        result = calibrate_gpu(passes=1)
+        self.assertIn(result["status"],
+                      ("ok", "unavailable", "no_gpu_found", "bad_device_index"))
+        if result["status"] != "ok":
+            self.assertIn("reason", result)
+
+    def test_cpu_opencl_runtimes_are_never_benchmarked_as_gpus(self):
+        """
+        1.x iterated every OpenCL device, so an Intel or AMD CPU runtime would
+        be benchmarked and reported as a graphics card.
+        """
+        from benchmarks.gpu.devices import list_all_devices, list_gpu_devices
+
+        gpus = list_gpu_devices()
+        for device in gpus:
+            self.assertEqual(device["device_class"], "gpu")
+        non_gpu = [d for d in list_all_devices() if d["device_class"] != "gpu"]
+        for device in non_gpu:
+            self.assertNotIn(device["name"], [g["name"] for g in gpus])
+
+    def test_gpu_baselines_cover_every_scored_workload(self):
+        """A workload with no baseline scores 0 and silently vanishes."""
+        from benchmarks.gpu.gpu_suite import GPU_BASELINES
+
+        for key in ("fp32_compute", "fp64_compute", "memory_bandwidth", "matrix"):
+            self.assertIn(key, GPU_BASELINES)
+            self.assertGreater(GPU_BASELINES[key], 0)
+
+    def test_fp_chain_is_stable_at_tuned_loop_counts(self):
+        """
+        The loop count is now tuned per device and can reach several thousand.
+        With the old multiplier range of [0.9, 1.1] the dependent chain grows
+        as y^n and overflows to infinity, failing validation on a healthy GPU.
+        """
+        import numpy as np
+
+        rng = np.random.default_rng(2026)
+        b = rng.uniform(0.90, 0.99, size=128)
+        self.assertLess(b.max(), 1.0,
+                        "the multiplier must stay below 1 or the chain diverges")
+
+        rng = np.random.default_rng(2026)
+        a = rng.uniform(0.5, 1.0, size=128)
+        x = a.copy()
+        for _ in range(10_000):
+            x = x * b + 0.001
+        self.assertTrue(np.all(np.isfinite(x)))
+        # Converges to the analytic fixed point.
+        self.assertTrue(np.allclose(x, 0.001 / (1 - b), rtol=1e-6))
+
+    def test_warmup_and_tuning_constants_are_sane(self):
+        from benchmarks.gpu.gpu_suite import (
+            GPU_WARMUP_SECONDS, TARGET_LAUNCH_SECONDS, DEFAULT_REPS)
+
+        # A GPU needs 100 ms+ to reach a steady boost clock.
+        self.assertGreaterEqual(GPU_WARMUP_SECONDS, 0.1)
+        # A launch must be long enough that clock jitter averages out.
+        self.assertGreaterEqual(TARGET_LAUNCH_SECONDS, 0.005)
+        self.assertGreaterEqual(DEFAULT_REPS, 5)
+
+    def test_transfer_is_deliberately_unscored(self):
+        """
+        Host transfer bandwidth is a PCIe property, not a property of the GPU's
+        compute units, so it must never enter the composite score.
+        """
+        from benchmarks.gpu.gpu_suite import GPU_BASELINES
+        self.assertNotIn("transfer", GPU_BASELINES)
+
+
 class TestAnalysis(unittest.TestCase):
     def test_throttling_detected_from_falling_clock(self):
         from ai.analysis import analyze_throttling

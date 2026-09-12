@@ -62,8 +62,21 @@ __kernel void triad(__global const float *a,
 }
 """
 
-# Naive tiled matrix multiply. Not a competitive GEMM implementation, and not
-# meant to be: it is a comparable fixed workload across vendors.
+# Tiled matrix multiply. Deliberately a comparable fixed workload across
+# vendors rather than a competitive GEMM.
+#
+# Be careful how you read its result. On an RTX 3050 Laptop it reaches about
+# 283 GFLOPS, which is only 3.6% of what the FP32 kernel achieves on the same
+# device. Two reasons, both inherent to this implementation:
+#
+#   * a 16x16 tile uses 2 KB of local memory out of the 48 KB available
+#   * there is no register blocking, so every multiply-add reads from local
+#     memory instead of accumulating several outputs per thread
+#
+# A tuned GEMM would reach 15-25% of peak. This number is therefore a measure
+# of "naive tiled GEMM throughput", not of the device's matrix capability, and
+# the spec says so. Improving it would change the baseline, so it is a
+# deliberate future change rather than a quiet fix.
 MATRIX_MULTIPLY = """
 #define TILE 16
 __kernel void matmul(__global const float *A,

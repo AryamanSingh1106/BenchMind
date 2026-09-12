@@ -1,5 +1,177 @@
 # Changelog
 
+## 2.2.2
+
+GPU baselines measured. `GPU_BASELINES` has held invented placeholder values
+since the GPU suite was written; it now holds real numbers from reference GPU
+G1, an RTX 3050 6GB Laptop calibrated over five passes.
+
+    fp32_compute      7,780.44 GFLOPS   spread 0.66%
+    fp64_compute        131.96 GFLOPS   spread 0.37%
+    memory_bandwidth    156.93 GB/s     spread 1.00%
+    matrix              282.86 GFLOPS   spread 0.43%
+
+### What the 2.2.1 warmup fix was actually worth
+
+FP32 went from 3,289 to 7,780 GFLOPS on the same device. That is not a
+regression in the earlier measurement's honesty, it is the whole point of the
+fix: the old 0.31 ms kernel with a single warmup launch was measured entirely
+at idle clock. A 2.4x idle-to-boost ratio is normal for a laptop GPU.
+
+The confirming evidence is the FP32:FP64 ratio, which nobody tuned:
+
+    before 2.2.1    3,289 : 133    =  1/24.7    physically impossible
+    after  2.2.1    7,780 : 132    =  1/59      consumer Ampere is 1/64
+
+An FP32:FP64 ratio of 1/24.7 cannot occur on this architecture. The FP64
+kernel, being ~25x slower per launch, had always been long enough to reach
+boost clock; FP32 had not. Two independently measured workloads now agreeing
+with the architectural ratio is much stronger evidence than either number on
+its own.
+
+Memory bandwidth is unchanged at ~157 GB/s, as expected: it is bandwidth-bound
+rather than clock-bound, so it was already correct.
+
+### Elsewhere
+
+- `REFERENCE_GPU` added alongside `REFERENCE_MACHINE`, so results can name
+  what they were scored against.
+- The matrix kernel note updated: 283 GFLOPS is 3.6% of this device's FP32,
+  not the 6.5% quoted when FP32 was being under-measured. Still a property of
+  the kernel rather than the hardware.
+
+## 2.2.1
+
+GPU measurement stability. The 2.2.0 calibration gate did its job and refused
+two of four workloads on an RTX 3050 Laptop:
+
+    workload          launch     spread    median vs a cold single run
+    fp32_compute      0.31 ms     0.67%    3,289 vs 3,291   stable
+    memory_bandwidth  1.22 ms     0.12%      157 vs 157     stable
+    fp64_compute      7.68 ms    11.11%      133 vs 100     +33%
+    matrix            7.49 ms     6.32%      287 vs 215     +33%
+
+Both refused workloads were noisy AND had shifted a third higher between a
+cold run and a back-to-back calibration pass. That is a clock-ramp signature,
+not scatter.
+
+### Warmup was one launch, against a 100 ms clock ramp
+
+A GPU takes 100 ms or more to go from idle clock to steady boost. Each kernel
+got exactly one warmup launch — 7.5 ms for matrix — so the clock was still
+ramping during the measurement: early repetitions slow, later ones fast, and a
+pass starting warm measured something different again.
+
+fp32 looked stable only by accident: nine launches of 0.31 ms is 2 ms of work,
+so the GPU never left its idle clock and was consistently slow.
+
+`_warmup_kernel()` now launches for a duration (350 ms) rather than once, and
+reports how many launches that took — a device needing hundreds is telling you
+about its clock behaviour.
+
+### Launch duration is tuned per device
+
+A fixed 128 iterations cannot suit both an RTX 3050 and an Intel iGPU; on the
+3050 it was 0.31 ms, far too short to measure through clock jitter.
+`_tune_inner_loops()` probes once and scales the loop count so a launch takes
+about 20 ms. Since the reported metric is a rate, doing different work per
+device is correct, and it is what keeps every device's launch measurable.
+
+`inner_loops`, `launch_ms` and the warmup counts are all reported.
+
+### The FP chain would have overflowed at tuned loop counts
+
+Found while implementing the above, not in the field. The kernel runs a
+dependent chain `x = fma(x, y, 0.001)` with `y` drawn from [0.9, 1.1]. For
+y > 1 that grows as y^n: harmless at the old fixed 128 iterations, fatal at
+the tuned ~8,258, where 1.1^8258 overflows to infinity and validation fails on
+a perfectly healthy GPU.
+
+`y` now comes from [0.90, 0.99], so the chain converges toward 0.001/(1-y) and
+is stable at any loop count. Identical reasoning to the CPU `floating_point`
+workload, which had the same defect fixed in 2.0.0 — worth noting that the
+same mistake appeared twice, in code written months apart.
+
+FP32's tolerance was loosened to 2e-2, since thousands of dependent steps
+accumulate visible rounding. Still orders of magnitude tighter than the gap
+between a correct and an incorrect result.
+
+### Elsewhere
+
+- `DEFAULT_REPS` 7 -> 9; `_bench_matrix` now uses it instead of a hardcoded 5.
+- 124 tests, up from 122.
+
+## 2.2.0
+
+GPU suite verified on real hardware for the first time, and given a
+calibration path.
+
+Until now `benchmarks/gpu/` had never executed against an OpenCL device — it
+was only ever exercised down the "unavailable" branch. First contact was with
+an RTX 3050 6GB Laptop and an Intel Raptor Lake iGPU, and it ran without
+modification: both devices detected and correctly classified, FP64 correctly
+detected as present on the NVIDIA part and absent on the Intel one, all
+kernels validating against their CPU references.
+
+Sanity of the measured numbers, which is the real test of whether the kernels
+do what they claim:
+
+    fp32_compute      3,291 GFLOPS   54% of ~6.1 TFLOPS theoretical, which is
+                                     what a dependent FMA chain should give
+    fp64_compute        100 GFLOPS   1/33 of FP32; consumer Ampere is spec'd
+                                     at 1/32, so the kernel really is doing
+                                     FP64 rather than silently demoting
+    memory_bandwidth    157 GB/s     94% of ~168 GB/s theoretical
+    matrix              215 GFLOPS   6.5% of its own FP32 figure -- too low
+
+### OpenCL build logs are no longer discarded
+
+PyOpenCL raises a `CompilerWarning` for non-empty compiler output and then
+throws the text away. Vendor compilers put register-spill notices, occupancy
+hints and unroll decisions there, and on a kernel whose throughput looks wrong
+that text is usually the explanation.
+
+`_build_program()` now captures the log per kernel, logs it, and includes it
+in the result and in calibration output. On a build failure the log is
+surfaced as an error, since it is the only useful diagnostic.
+
+### GPU calibration, with the same spread gate as the CPU
+
+`GPU_BASELINES` shipped as invented placeholders, so an RTX 3050 scoring "615"
+was a ratio against a number nobody had measured.
+
+- `calibrate_gpu()` runs several full passes and reports per-workload medians
+  with their spread.
+- `python -m scripts.calibrate_baselines --gpu --passes 5` emits a pasteable
+  block, and refuses above the spread limit exactly as the CPU path does, with
+  GPU-specific causes listed: another application using the GPU, the laptop's
+  GPU power limit shifting, driver clock-down between passes, or an integrated
+  GPU competing with the CPU for memory.
+- The default device is the one with the most compute units, which on a laptop
+  means the discrete GPU rather than the integrated one. `--gpu-device`
+  overrides.
+- `GPU_BASELINES` is now explicitly labelled as unmeasured in the source, with
+  the real 3050 figures recorded alongside for scale, so nobody mistakes a GPU
+  score for a calibrated one before the calibration is run.
+
+### The matrix kernel understates the hardware
+
+215 GFLOPS against 3,291 GFLOPS on the same device is not a hardware finding,
+it is a limitation of the kernel: a 16x16 tile uses 2 KB of the 48 KB local
+memory available, and without register blocking every multiply-add reads from
+local memory. A tuned GEMM would reach 15-25% of peak.
+
+Documented in `kernels.py` rather than quietly fixed, because improving the
+kernel changes the baseline and that should be a deliberate versioned change.
+
+### Elsewhere
+
+- 122 tests, up from 117. The new GPU tests run without a GPU present, which
+  is the normal state in CI: they assert that an unavailable device explains
+  itself, that CPU OpenCL runtimes are never benchmarked as graphics cards,
+  that every scored workload has a baseline, and that host transfer bandwidth
+  stays deliberately unscored.
+
 ## 2.1.2
 
 Baseline set unchanged (`2.1.0`); scores remain comparable to 2.1.0 and 2.1.1.

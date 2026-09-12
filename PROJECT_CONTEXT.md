@@ -10,7 +10,7 @@
 > - `docs/BENCHMARK_SPEC.md` — methodology, baselines, scoring (**the contract**)
 > - `CHANGELOG.md` — what changed and when
 
-Version 2.1.2
+Version 2.2.2
 
 ---
 
@@ -185,6 +185,12 @@ reintroduces the bug.
     steady.
 10c. **A throttle verdict requires a measured drop in clock or power.**
     Temperature alone is corroborating evidence, never sufficient.
+10d. **Warm a GPU by duration, not by one launch.** It needs 100 ms+ to reach
+    a steady boost clock, and a short kernel measured during the ramp gives
+    both a noisy spread and a median that depends on how warm it started.
+10e. **A dependent FMA chain must use a multiplier below 1.** Above 1 it grows
+    as y^n and overflows once the loop count is tuned up. This defect has now
+    appeared twice, in the CPU and GPU kernels independently.
 11. **Never compare across fingerprints, modes or baseline versions.**
 12. **Importing anything must never require credentials.**
 13. **Never assert on timings in CI.** CI runners are noisy VMs; timing
@@ -199,8 +205,10 @@ confidence intervals, topology-aware core pinning, warm pool, shared registry,
 aligned single/multi work, thread scaling curve. Reference R2 measured with
 every category under 1.7% spread.
 
-**GPU** — rewritten and structurally sound, but **the baselines are untested
-placeholders**. Needs a run on real hardware and recalibration.
+**GPU** — complete and calibrated. Reference G1 (RTX 3050 6GB Laptop) measured
+over five passes with a worst spread of 1.00%, and the FP32:FP64 ratio lands
+at 1/59 against Ampere's architectural 1/64. The matrix kernel understates the
+hardware and is documented as such rather than quietly improved.
 
 **Telemetry** — decoupled temperature polling, frequency and per-core logging,
 sampling-health reporting.
@@ -214,7 +222,7 @@ single-file dashboard.
 **Storage** — SQLite history with fingerprint-aware regression detection.
 Supabase optional.
 
-**Tests** — 117, all passing, none timing-dependent.
+**Tests** — 124, all passing, none timing-dependent.
 
 ---
 
@@ -223,7 +231,7 @@ Supabase optional.
 1. **Done.** Reference R2 calibrated on physical hardware; worst spread 1.68%.
 2. Run `python run.py repeat --runs 5` and confirm spread is under 2%. Expect
    downward drift on a laptop; raise `--cooldown` if it appears.
-3. Run the GPU suite on the RTX 3050 and calibrate the GPU baselines.
+3. **Done.** Reference G1 calibrated; worst spread 1.00%.
 4. Freeze the CPU implementation; bump `BASELINE_VERSION` on any change after
    that point.
 5. RAM latency and bandwidth benchmark.

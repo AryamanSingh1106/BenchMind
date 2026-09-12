@@ -153,8 +153,8 @@ anything that affects measurement.
 - The reference machine R1 is a cloud instance and therefore a poor reference.
   Recalibrate against physical hardware with
   `python -m scripts.calibrate_baselines`.
-- GPU baselines are untested placeholders. Run the suite on a real GPU and
-  recalibrate before trusting GPU scores.
+- GPU reference G1 is a laptop RTX 3050, so it is power- and thermally
+  constrained compared to a desktop card of the same name.
 - No RAM latency, storage or network benchmark yet.
 - Core pinning targets logical core 0 without topology detection, so on a
   hybrid CPU it may land on a P-core or an E-core.

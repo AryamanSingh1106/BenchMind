@@ -41,6 +41,7 @@ calibration will be something else.
 Usage:
     python -m scripts.calibrate_baselines --reps 5
     python -m scripts.calibrate_baselines --reps 9 --max-spread 3
+    python -m scripts.calibrate_baselines --gpu --passes 5
 """
 
 from __future__ import annotations
@@ -199,6 +200,113 @@ def calibrate(reps: int = 5, mode_target: float = 1.5,
     return baselines
 
 
+# --------------------------------------------------------------------------
+# GPU calibration
+# --------------------------------------------------------------------------
+def calibrate_gpu_baselines(device_index=None, passes: int = 5,
+                            reps: int = 7, max_spread: float = 5.0,
+                            force: bool = False) -> Dict[str, float]:
+    """
+    Measure a reference GPU and emit a GPU_BASELINES block.
+
+    GPU_BASELINES shipped as invented placeholders, which made every GPU score
+    a ratio against a number nobody had measured. An RTX 3050 Laptop scoring
+    "615" said nothing at all.
+
+    Same spread gate as the CPU path: a baseline captured from noisy data
+    permanently miscalibrates its workload while looking authoritative.
+    """
+    from benchmarks.gpu.gpu_suite import calibrate_gpu
+    from monitoring.validity import check_run_validity
+
+    gate = check_run_validity(sample_seconds=3.0)
+    print(f"Conditions: {gate.verdict}")
+    for issue in gate.issues:
+        print(f"  ! {issue.message}")
+    if gate.verdict != "valid" and not force:
+        print("\nRefusing to calibrate under these conditions. On a laptop the "
+              "discrete GPU is power-limited alongside the CPU, so a tainted "
+              "run misprices every future GPU score.")
+        raise SystemExit(1)
+
+    print(f"\nRunning {passes} GPU passes. This takes a few minutes.\n")
+    result = calibrate_gpu(device_index=device_index, passes=passes, reps=reps)
+
+    if result.get("status") != "ok":
+        print(f"GPU calibration unavailable: {result.get('reason')}")
+        raise SystemExit(1)
+
+    info = result["device"]
+    print(f"Reference GPU: {info.get('name')}")
+    print(f"  vendor {info.get('vendor')} | {info.get('compute_units')} compute units "
+          f"| {info.get('max_clock_mhz')} MHz | {info.get('global_mem_mb')} MB")
+    print(f"  driver {info.get('driver_version')} | {info.get('opencl_version')} "
+          f"| fp64 {'yes' if info.get('supports_fp64') else 'no'}")
+
+    if result.get("build_logs"):
+        print("\nOpenCL compiler notes (these explain unexpected throughput):")
+        for kernel, log in result["build_logs"].items():
+            first = log.splitlines()[0] if log.splitlines() else log
+            print(f"  {kernel}: {first}")
+
+    measured = result["measured"]
+    units = {"fp32_compute": "GFLOPS", "fp64_compute": "GFLOPS",
+             "memory_bandwidth": "GB/s", "matrix": "GFLOPS"}
+
+    print("\n" + "-" * 70)
+    spreads: Dict[str, float] = {}
+    baselines: Dict[str, float] = {}
+    for key, data in measured.items():
+        spreads[key] = data["spread_pct"]
+        baselines[key] = data["median"]
+        flag = "  <-- TOO NOISY" if data["spread_pct"] > max_spread else ""
+        print(f"  {key:<20} {data['median']:>12,.2f} {units.get(key, ''):<8} "
+              f"spread {data['spread_pct']:>6.2f}%{flag}")
+    for key in result.get("skipped", []):
+        print(f"  {key:<20} {'skipped':>12}  (device does not support it)")
+    print("-" * 70)
+
+    gate_result = evaluate_spreads(spreads, [], max_spread)
+    if not gate_result["acceptable"] and not force:
+        print(f"\nREFUSING to emit GPU baselines: {len(gate_result['noisy'])} "
+              "workload(s) exceeded the spread limit.")
+        for key, spread in gate_result["noisy"].items():
+            print(f"    {key}: {spread:.2f}%")
+        print("\nGPU-specific causes, in order of likelihood:")
+        print("  - another application using the GPU (browser compositing, a game,")
+        print("    a video call, anything with hardware acceleration)")
+        print("  - the laptop's GPU power limit shifting as the chassis warms")
+        print("  - NVIDIA's driver clocking down between passes; check with")
+        print("    nvidia-smi -q -d CLOCK while a pass is running")
+        print("  - on an integrated GPU, the CPU competing for the same memory")
+        raise SystemExit(1)
+
+    print("\nPaste into benchmarks/gpu/gpu_suite.py:\n")
+    print("GPU_BASELINES = {")
+    for key in ("fp32_compute", "fp64_compute", "memory_bandwidth", "matrix"):
+        if key in baselines:
+            print(f'    "{key}": {baselines[key]},'
+                  f'{"":<4}# {units.get(key, "")}  '
+                  f'(spread {spreads[key]:.2f}% over {passes} passes)')
+        else:
+            print(f'    # "{key}": not measured on this device')
+    print("}")
+
+    print("\nAlso record the reference GPU in docs/BENCHMARK_SPEC.md section 8:")
+    print(json.dumps({
+        "name": info.get("name"),
+        "compute_units": info.get("compute_units"),
+        "max_clock_mhz": info.get("max_clock_mhz"),
+        "driver_version": info.get("driver_version"),
+        "opencl_version": info.get("opencl_version"),
+        "supports_fp64": info.get("supports_fp64"),
+        "passes": passes,
+        "worst_spread_pct": gate_result["worst_spread_pct"],
+    }, indent=2))
+
+    return baselines
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Recalibrate BenchMind baselines.")
     parser.add_argument("--reps", type=int, default=5,
@@ -207,8 +315,21 @@ def main() -> int:
                         help="Refuse to emit baselines above this spread percentage.")
     parser.add_argument("--force", action="store_true",
                         help="Emit baselines even when too noisy. Not recommended.")
+    parser.add_argument("--gpu", action="store_true",
+                        help="Calibrate GPU baselines instead of CPU.")
+    parser.add_argument("--passes", type=int, default=5,
+                        help="GPU calibration passes (with --gpu).")
+    parser.add_argument("--gpu-device", type=int, default=None,
+                        help="Index into list_gpu_devices(). Defaults to the "
+                             "device with the most compute units.")
     args = parser.parse_args()
-    result = calibrate(reps=args.reps, max_spread=args.max_spread, force=args.force)
+
+    if args.gpu:
+        result = calibrate_gpu_baselines(
+            device_index=args.gpu_device, passes=args.passes,
+            max_spread=args.max_spread, force=args.force)
+    else:
+        result = calibrate(reps=args.reps, max_spread=args.max_spread, force=args.force)
     return 0 if result else 1
 
 

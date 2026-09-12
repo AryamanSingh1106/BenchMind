@@ -1,6 +1,6 @@
 # BenchMind Benchmark Specification
 
-Version 2.1.2 · baseline set `2.1.0`
+Version 2.2.2 · baseline set `2.1.0`
 
 This document is the contract for what a BenchMind score means. If you change
 a workload, a baseline, or a scoring rule, change this file in the same commit
@@ -333,11 +333,58 @@ and checked against a CPU reference.
 
 The FMA kernels use a dependent chain specifically so the compiler cannot hoist
 the loop out; an independent chain would be optimized away and the benchmark
-would measure the optimizer.
+would measure the optimizer. The multiplier is drawn from [0.90, 0.99] so the
+chain converges rather than diverging: with a multiplier above 1 it grows as
+y^n and overflows once the loop count is tuned upward.
 
-**The GPU baselines have not been measured on real hardware.** They are
-placeholders. Run the suite on your RTX 3050 and recalibrate before treating
-GPU scores as meaningful.
+**Warmup and launch sizing.** A GPU needs 100 ms or more to reach a steady
+boost clock, so each kernel is launched repeatedly for 350 ms before any
+timing. The inner loop count is then tuned per device so a single launch takes
+about 20 ms. A fixed loop count cannot suit both a discrete and an integrated
+GPU, and since the metric is a rate, doing different work per device is
+correct. Without both of these, an RTX 3050 measured 11% spread on FP64 and a
+median that moved 33% between a cold run and a warm one.
+
+### 8.1 Reference GPU G1
+
+```
+Device     NVIDIA GeForce RTX 3050 6GB Laptop GPU
+           20 compute units, 1492 MHz reported max clock, 6143 MB
+Driver     610.74
+OpenCL     3.0 CUDA, cl_khr_fp64 supported
+Conditions validity gate 'valid', mains power, 5 passes
+```
+
+| Workload | G1 median | Unit | Spread |
+|---|---|---|---|
+| fp32_compute | 7,780.44 | GFLOPS | 0.66% |
+| fp64_compute | 131.96 | GFLOPS | 0.37% |
+| memory_bandwidth | 156.93 | GB/s | 1.00% |
+| matrix | 282.86 | GFLOPS | 0.43% |
+
+**Why these are trustworthy.** Repeatability alone would not be enough — a
+consistently wrong measurement is still wrong. Two independent checks:
+
+* **FP32:FP64 lands at 1/59**, against consumer Ampere's architectural 1/64.
+  Before the 2.2.1 warmup fix the same device measured 1/24.7, which is
+  physically impossible for this architecture. The FP32 kernel was being timed
+  at idle clock; the FP64 kernel, ~25x slower per launch, had always been long
+  enough to reach boost.
+* **Memory bandwidth is 93%** of the card's ~168 GB/s theoretical, about what
+  a STREAM triad should achieve.
+
+**How to read the matrix figure.** 283 GFLOPS is 3.6% of this device's FP32
+result. That is a property of **this kernel**, not the device: a 16×16 tile
+uses 2 KB of the 48 KB local memory available, and without register blocking
+every multiply-add reads from local memory. A tuned GEMM reaches 15–25% of
+peak. Read it as "naive tiled GEMM throughput", comparable across vendors,
+not as the device's matrix capability.
+
+An Intel Raptor Lake iGPU on the same machine measured 130 GFLOPS FP32 and
+32 GB/s, with no FP64 support. Note those figures predate the 2.2.1 warmup
+fix and are almost certainly idle-clock measurements, as the 3050's were; the
+iGPU has not been recalibrated. It remains a useful contrast, since it shares
+the system's DDR5 with the CPU.
 
 ---
 
