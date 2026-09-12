@@ -42,8 +42,25 @@ from benchmarks.cpu.common import (
 
 logger = logging.getLogger("BenchMind.CPU.MultiCore")
 
-DEFAULT_CHUNKS_PER_WORKER = 2
 DEFAULT_REPS = 5
+
+# Chunking is chosen adaptively per workload; see `_choose_waves`.
+#
+# A "wave" is one chunk per worker. With too few waves, a repetition's wall
+# time is set by whichever worker finishes last, and on a hybrid CPU an E-core
+# chunk takes substantially longer than a P-core one -- so every repetition is
+# dominated by a straggler and which core drew which chunk varies run to run.
+#
+# Measured on an i5-13450HX (6P + 4E) at the fixed 2 waves used through 2.1.1:
+#     single-core confidence interval  +/- 0.7%
+#     multi-core confidence interval   +/- 5.6%
+#
+# More waves let the pool self-balance: residual imbalance is roughly one
+# chunk out of `waves`, so 8 waves cuts it to an eighth. But a workload with a
+# 1.3 s chunk (compression) cannot afford 8 waves, hence the time budget.
+MIN_WAVES = 2
+MAX_WAVES = 8
+TARGET_REP_SECONDS = 1.0
 
 
 class WarmPool:
@@ -99,28 +116,60 @@ class WarmPool:
                 logger.error("Worker prepare failed for %s: %s", workload_key, e)
 
 
+def _choose_waves(chunk_seconds: float) -> int:
+    """
+    Pick how many chunks per worker to dispatch, from one timed chunk.
+
+    Enough waves that the pool can hide the P-core/E-core speed difference,
+    few enough that a slow workload does not make each repetition take
+    forever. Clamped to [MIN_WAVES, MAX_WAVES].
+    """
+    if chunk_seconds <= 0:
+        return MAX_WAVES
+    waves = round(TARGET_REP_SECONDS / chunk_seconds)
+    return int(max(MIN_WAVES, min(MAX_WAVES, waves)))
+
+
 def run_multi_core_subtest(
     pool: WarmPool,
     spec: registry.WorkloadSpec,
     num_workers: int,
     scale: float = 1.0,
-    chunks_per_worker: int = DEFAULT_CHUNKS_PER_WORKER,
+    chunks_per_worker: Optional[int] = None,
     reps: int = DEFAULT_REPS,
 ) -> SubtestResult:
     """
     Run one workload across `num_workers` processes, `reps` times.
 
-    Timing starts only after the pool is warm and every worker has its context
-    cached, so the measured window contains dispatch plus compute and nothing
-    else.
+    Timing starts only after the pool is warm, every worker has its context
+    cached, AND one calibration wave has been timed so the chunk count can be
+    chosen to suit this workload's duration. None of that is inside the
+    measured window.
     """
     subtest_start = time.perf_counter()
 
     prep_t0 = time.perf_counter()
     pool.prepare_workload(spec.key, scale)
+
+    # Untimed calibration: one wave, to learn how long a chunk takes here.
+    if chunks_per_worker is None:
+        assert pool.executor is not None
+        cal_t0 = time.perf_counter()
+        cal_futures = [pool.executor.submit(worker_execute, spec.key, scale, 1)
+                       for _ in range(num_workers)]
+        for f in concurrent.futures.as_completed(cal_futures):
+            f.result()
+        chunk_seconds = time.perf_counter() - cal_t0
+        waves = _choose_waves(chunk_seconds)
+        logger.info("%s: chunk ~%.3fs -> %d waves (%d chunks over %d workers)",
+                    spec.key, chunk_seconds, waves, waves * num_workers, num_workers)
+    else:
+        waves = max(1, chunks_per_worker)
+        chunk_seconds = 0.0
+
     setup_time = time.perf_counter() - prep_t0
 
-    total_tasks = max(1, num_workers * chunks_per_worker)
+    total_tasks = max(1, num_workers * waves)
     run_times: List[float] = []
     work_per_rep: List[float] = []
     validation_passed = True
@@ -206,6 +255,12 @@ def run_multi_core_subtest(
         bytes_moved=spec.bytes_per_run * scale * total_tasks,
         working_set_bytes=spec.working_set_bytes * scale,
         threads=len(worker_pids) or num_workers,
+        chunk_waves=waves,
+        # Residual load imbalance is bounded by roughly one chunk out of
+        # `waves`. Reported because it is the dominant remaining source of
+        # multi-core spread on the two slowest workloads, where the time
+        # budget forces waves down to MIN_WAVES.
+        imbalance_bound_pct=round(100.0 / max(waves, 1), 1),
         measures_runtime=spec.measures_runtime,
         counted_in_index=spec.counted_in_index,
         validation_passed=validation_passed,
@@ -246,6 +301,14 @@ def run_multi_core_suite(
     meta = {
         "pool_startup_seconds": round(pool_startup, 4),
         "pool_warmed_before_timing": True,
+        "adaptive_chunking": True,
+        "chunk_waves_range": [MIN_WAVES, MAX_WAVES],
+        "chunk_waves_by_workload": {
+            r.category: r.chunk_waves for r in results if r.chunk_waves
+        },
+        "load_balance_limited": sorted(
+            r.category for r in results if r.chunk_waves <= MIN_WAVES
+        ),
         "composite_ci_pct": composite_ci,
         "reps_per_subtest": reps,
         "subtests_counted": len(scored),
@@ -295,8 +358,7 @@ def run_scaling_curve(
     for n in _thread_counts(max_threads):
         with WarmPool(n) as pool:
             result = run_multi_core_subtest(
-                pool, spec, n, scale=scale,
-                chunks_per_worker=DEFAULT_CHUNKS_PER_WORKER, reps=reps,
+                pool, spec, n, scale=scale, reps=reps,
             )
         throughput = result.raw_metric_value
         if baseline_throughput is None:

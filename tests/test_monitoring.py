@@ -297,6 +297,59 @@ class TestHistoryStore(unittest.TestCase):
         self.assertEqual(verdict["verdict"], "incomparable")
 
 
+class TestHistoryValidityFiltering(unittest.TestCase):
+    """
+    The fingerprint deliberately excludes power state, so a battery run and a
+    mains run share a fingerprint. The validity gate is what separates them,
+    and any caller computing a spread must respect it.
+    """
+
+    def setUp(self):
+        import tempfile
+        from pathlib import Path
+        from storage.history import HistoryStore
+        self.tmp = tempfile.TemporaryDirectory()
+        self.store = HistoryStore(Path(self.tmp.name) / "t.db")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _run(self, index, verdict):
+        return {
+            "system": {"cpu": "x", "os": "y", "logical_cores": 16},
+            "environment": {"fingerprint_hash": "abc", "benchmind_version": "2.1.2"},
+            "validity": {"verdict": verdict},
+            "cpu_benchmark": {
+                "mode": "standard", "cpu_index": index, "cpu_index_ci_pct": 1.0,
+                "single_core_score": index, "multi_core_score": index,
+                "category_scores": {}, "telemetry_summary": {},
+            },
+            "throttling": {}, "stability": {},
+        }
+
+    def test_valid_only_excludes_tainted(self):
+        self.store.save_run(self._run(2500, "valid"))
+        self.store.save_run(self._run(2520, "valid"))
+        self.store.save_run(self._run(1900, "tainted"))   # e.g. on battery
+
+        everything = self.store.recent_runs(limit=10)
+        clean = self.store.recent_runs(limit=10, valid_only=True)
+
+        self.assertEqual(len(everything), 3)
+        self.assertEqual(len(clean), 2)
+        self.assertNotIn(1900, [r["cpu_index"] for r in clean])
+
+    def test_mixing_verdicts_inflates_spread(self):
+        """The bug this fixes: 24% reported where a controlled test saw 3%."""
+        from ai.stability_engine import repeatability_from_scores
+
+        mixed = repeatability_from_scores([2500, 2520, 1900])
+        clean = repeatability_from_scores([2500, 2520])
+
+        self.assertGreater(mixed["spread_pct"], 10.0)
+        self.assertLess(clean["spread_pct"], 2.0)
+
+
 class TestAnalysis(unittest.TestCase):
     def test_throttling_detected_from_falling_clock(self):
         from ai.analysis import analyze_throttling

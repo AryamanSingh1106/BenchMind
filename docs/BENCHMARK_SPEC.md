@@ -1,6 +1,6 @@
 # BenchMind Benchmark Specification
 
-Version 2.1.1 · baseline set `2.1.0`
+Version 2.1.2 · baseline set `2.1.0`
 
 This document is the contract for what a BenchMind score means. If you change
 a workload, a baseline, or a scoring rule, change this file in the same commit
@@ -351,8 +351,12 @@ Recorded honestly rather than hidden:
    Numba.
 2. **NumPy ufunc call overhead** is roughly 5–10% of the L2-resident workloads.
    It is inside the measurement.
-3. **The SMT sibling of the pinned core cannot be reserved.** Other processes
+3. **`compression` and `branch_heavy` multi-core results are load-balance
+   limited.** Measuring throughput over a fixed time window instead of
+   time-to-complete-fixed-work would remove the straggler effect, but changes
+   what the metric means and would invalidate the baselines.
+4. **The SMT sibling of the pinned core cannot be reserved.** Other processes
    may be scheduled onto it, sharing execution resources with the measurement.
    Reported, not solved.
-4. **No RAM latency, storage, or network benchmark** yet.
-5. **The GPU baselines are still untested placeholders.** They have never been measured on real hardware; run the suite on a real GPU and recalibrate before treating GPU scores as meaningful.
+5. **No RAM latency, storage, or network benchmark** yet.
+6. **The GPU baselines are still untested placeholders.** They have never been measured on real hardware; run the suite on a real GPU and recalibrate before treating GPU scores as meaningful.

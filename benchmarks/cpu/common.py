@@ -127,6 +127,8 @@ class SubtestResult:
     warmup_time: float = 0.0         # untimed warmup cost
     warmup_reps: int = 0
     short_rep_warning: bool = False   # repetitions too brief to be stable
+    chunk_waves: int = 0              # multi-core: chunks dispatched per worker
+    imbalance_bound_pct: float = 0.0  # multi-core: worst-case straggler effect
     arithmetic_intensity: float = 0.0  # work units per byte moved (roofline input)
     bytes_moved: float = 0.0
     working_set_bytes: float = 0.0

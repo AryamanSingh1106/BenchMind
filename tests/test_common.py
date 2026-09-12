@@ -286,5 +286,53 @@ class TestTimedRunner(unittest.TestCase):
         self.assertIsInstance(result.score_ci_pct, float)
 
 
+class TestAdaptiveChunking(unittest.TestCase):
+    """
+    Multi-core wave selection. Through 2.1.1 this was fixed at 2 waves, which
+    left a real 6P+4E machine at +/- 5.6% multi-core against +/- 0.7%
+    single-core: every repetition was dominated by whichever worker drew the
+    slowest chunk.
+    """
+
+    def test_fast_workload_gets_maximum_waves(self):
+        from benchmarks.cpu.multi_core import MAX_WAVES, _choose_waves
+        self.assertEqual(_choose_waves(0.026), MAX_WAVES)
+
+    def test_slow_workload_is_time_bounded(self):
+        from benchmarks.cpu.multi_core import MIN_WAVES, _choose_waves
+        # A 1.3 s chunk cannot afford 8 waves; 8 x 1.3 x 5 reps is over a minute.
+        self.assertEqual(_choose_waves(1.287), MIN_WAVES)
+
+    def test_waves_respect_the_time_budget(self):
+        from benchmarks.cpu.multi_core import TARGET_REP_SECONDS, _choose_waves
+
+        for chunk in (0.05, 0.135, 0.3, 0.5):
+            with self.subTest(chunk=chunk):
+                waves = _choose_waves(chunk)
+                self.assertLessEqual(waves * chunk, TARGET_REP_SECONDS * 1.6)
+
+    def test_clamped_at_both_ends(self):
+        from benchmarks.cpu.multi_core import MAX_WAVES, MIN_WAVES, _choose_waves
+        self.assertEqual(_choose_waves(0.0), MAX_WAVES)      # degenerate
+        self.assertEqual(_choose_waves(1e-9), MAX_WAVES)     # absurdly fast
+        self.assertEqual(_choose_waves(60.0), MIN_WAVES)     # absurdly slow
+
+    def test_result_reports_its_imbalance_bound(self):
+        """A workload forced down to MIN_WAVES must say so, not hide it."""
+        import psutil
+        from benchmarks.cpu import registry
+        from benchmarks.cpu.multi_core import WarmPool, run_multi_core_subtest
+
+        workers = min(2, psutil.cpu_count(logical=True) or 1)
+        with WarmPool(workers) as pool:
+            result = run_multi_core_subtest(
+                pool, registry.get("integer"), workers, scale=0.05, reps=2)
+
+        self.assertGreaterEqual(result.chunk_waves, 2)
+        self.assertGreater(result.imbalance_bound_pct, 0.0)
+        self.assertAlmostEqual(result.imbalance_bound_pct,
+                               100.0 / result.chunk_waves, places=1)
+
+
 if __name__ == "__main__":
     unittest.main()

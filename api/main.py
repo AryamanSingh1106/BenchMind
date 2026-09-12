@@ -197,12 +197,16 @@ def _execute_benchmark(req: BenchmarkRequest, progress=None) -> Dict[str, Any]:
 
     store = get_store()
     fingerprint_hash = (cpu_result.get("environment") or {}).get("fingerprint_hash")
+    # valid_only: a spread computed across a mix of mains and battery runs
+    # measures the power cap, not the machine's repeatability.
     history_scores = [
         r["cpu_index"] for r in store.recent_runs(
-            limit=5, fingerprint_hash=fingerprint_hash, mode=req.mode)
+            limit=5, fingerprint_hash=fingerprint_hash, mode=req.mode,
+            valid_only=True)
         if r.get("cpu_index")
     ]
-    history_scores.append(cpu_result.get("cpu_index", 0))
+    if validity_report.verdict == "valid":
+        history_scores.append(cpu_result.get("cpu_index", 0))
 
     stability = build_stability_report(
         run_scores=history_scores,

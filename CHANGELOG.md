@@ -1,5 +1,64 @@
 # Changelog
 
+## 2.1.2
+
+Baseline set unchanged (`2.1.0`); scores remain comparable to 2.1.0 and 2.1.1.
+
+Both fixes came from one real run on the R2 machine, which reported
+`+/- 0.7%` single-core against `+/- 5.6%` multi-core and claimed 24.46%
+variance across four runs while a controlled repeat test on the same machine
+measured 2.98%.
+
+### Stability no longer mixes tainted runs with valid ones
+
+The environment fingerprint deliberately excludes power state: a laptop's
+battery level changes constantly and should not fragment the comparison pool.
+The validity gate is what catches a battery run, by marking it `tainted`.
+
+`comparable_baseline()` respected that and filtered on
+`validity_verdict = 'valid'`. The stability report did not: it pulled from
+`recent_runs()`, which had no verdict filter, so it averaged battery runs
+together with mains runs and reported the power cap as instability.
+
+- `recent_runs()` takes `valid_only`, and the stability path passes it.
+- A tainted run no longer contributes its own score to the spread either.
+
+### Multi-core chunking is adaptive
+
+`run_multi_core_subtest` dispatched a fixed `workers x 2` chunks. A
+repetition's wall time is set by whichever worker finishes last, and on a
+hybrid CPU an E-core chunk takes substantially longer than a P-core one, so
+with only two waves every repetition was dominated by a straggler and which
+core drew which chunk varied run to run. That is the whole 0.7% versus 5.6%
+asymmetry.
+
+One calibration wave is now timed before the measurement starts, and the
+chunk count is chosen from it: enough waves for the pool to self-balance, few
+enough that a slow workload does not make each repetition take forever.
+
+    workload        chunk      waves    worst-case imbalance
+    floating_point   26 ms        8            12%
+    integer          47 ms        8            12%
+    matrix           58 ms        8            12%
+    vector_simd      50 ms        8            12%
+    hashing         135 ms        7            14%
+    branch_heavy    494 ms        2            50%
+    compression    1287 ms        2            50%
+
+`compression` and `branch_heavy` remain load-balance limited, because eight
+waves of a 1.3 s chunk would put a single subtest over a minute. Rather than
+hide that, every multi-core result now carries `chunk_waves` and
+`imbalance_bound_pct`, and the suite meta lists `load_balance_limited`.
+
+The proper fix for those two is to measure throughput over a fixed time
+window instead of time-to-complete-fixed-work, which removes the straggler
+effect entirely. That changes what the metric means and would invalidate the
+baselines again, so it is deferred rather than rushed.
+
+### Elsewhere
+
+- 117 tests, up from 110.
+
 ## 2.1.1
 
 Baseline set unchanged (`2.1.0`); scores remain comparable to 2.1.0.

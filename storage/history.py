@@ -170,7 +170,22 @@ class HistoryStore:
     # ---------------- reads ----------------
     def recent_runs(self, limit: int = 20,
                     fingerprint_hash: Optional[str] = None,
-                    mode: Optional[str] = None) -> List[Dict[str, Any]]:
+                    mode: Optional[str] = None,
+                    valid_only: bool = False) -> List[Dict[str, Any]]:
+        """
+        Recent runs, newest first.
+
+        `valid_only` matters more than it looks. The environment fingerprint
+        deliberately excludes power state, because a laptop's battery level
+        changes constantly and should not fragment the comparison pool. But
+        running on battery can depress scores 10-20%, and the validity gate is
+        what catches that by marking the run `tainted`.
+
+        So any caller that computes a *spread* across runs must pass
+        valid_only=True. Through 2.1.1 the stability report did not, and mixed
+        battery and mains runs on one real machine, reporting 24.46% variance
+        where a controlled repeat test on the same machine measured 2.98%.
+        """
         sql = "SELECT * FROM runs"
         clauses, params = [], []
         if fingerprint_hash:
@@ -179,6 +194,8 @@ class HistoryStore:
         if mode:
             clauses.append("mode = ?")
             params.append(mode)
+        if valid_only:
+            clauses.append("validity_verdict = 'valid'")
         if clauses:
             sql += " WHERE " + " AND ".join(clauses)
         sql += " ORDER BY created_at DESC LIMIT ?"

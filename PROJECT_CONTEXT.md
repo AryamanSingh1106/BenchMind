@@ -10,7 +10,7 @@
 > - `docs/BENCHMARK_SPEC.md` — methodology, baselines, scoring (**the contract**)
 > - `CHANGELOG.md` — what changed and when
 
-Version 2.1.1
+Version 2.1.2
 
 ---
 
@@ -168,7 +168,10 @@ reintroduces the bug.
     `scripts/calibrate_baselines.py` enforces this; do not routinely `--force`.
 7d. **Never size a cache-resident working set at the cache capacity.** Target
     half of it. Straddling the boundary caused a 15% spread on `integer`.
-7e. **Watch for implicit allocation in the timed region.** `np.searchsorted(...)`
+7e. **Any spread computed across stored runs must filter to valid runs only.**
+    The fingerprint excludes power state by design, so battery and mains runs
+    share a fingerprint and only the validity verdict separates them.
+7f. **Watch for implicit allocation in the timed region.** `np.searchsorted(...)`
     and `arr[idx]` allocate their results; only `out=` parameters avoid it.
     Reductions and verification belong in `validate`, not `run`.
 8. **Never benchmark a CPU OpenCL runtime as a GPU.** Filter on
@@ -211,7 +214,7 @@ single-file dashboard.
 **Storage** — SQLite history with fingerprint-aware regression detection.
 Supabase optional.
 
-**Tests** — 110, all passing, none timing-dependent.
+**Tests** — 117, all passing, none timing-dependent.
 
 ---
 

@@ -12,4 +12,4 @@ tracks only the scoring baselines: two builds can share a baseline version and
 be directly comparable while differing in application version.
 """
 
-__version__ = "2.1.1"
+__version__ = "2.1.2"
