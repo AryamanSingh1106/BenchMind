@@ -35,6 +35,7 @@ from benchmarks.cpu.common import (
     geometric_mean,
     run_timed_subtest,
 )
+from monitoring.topology import get_topology, select_benchmark_core
 
 logger = logging.getLogger("BenchMind.CPU.SingleCore")
 
@@ -42,27 +43,47 @@ logger = logging.getLogger("BenchMind.CPU.SingleCore")
 @contextmanager
 def pinned_to_core(core: Optional[int] = None):
     """
-    Pin this process to a single logical core, if the platform allows it.
+    Pin this process to one deliberately chosen logical core.
 
-    Not available on macOS and some BSDs, in which case this is a no-op and the
-    result carries `core_pinned: False` so the report can say so honestly.
+    Yields a dict describing what actually happened, so the result records the
+    core that was used and why, rather than only that pinning was attempted.
+    Affinity is unavailable on macOS and some BSDs; there this is a no-op and
+    `pinned` is False.
     """
     proc = psutil.Process()
     original: Optional[List[int]] = None
-    pinned = False
-    try:
-        if hasattr(proc, "cpu_affinity"):
-            original = proc.cpu_affinity()
-            target = core if core is not None else (original[0] if original else 0)
-            proc.cpu_affinity([target])
-            pinned = True
-            logger.info("Pinned single-core suite to logical core %d", target)
-    except Exception as e:  # noqa: BLE001
-        logger.info("CPU affinity pinning unavailable on this platform: %s", e)
-        pinned = False
+
+    selection = select_benchmark_core()
+    target = core if core is not None else selection.get("logical_id")
+
+    state: Dict[str, Any] = {
+        "pinned": False,
+        "logical_id": target,
+        "requested_explicitly": core is not None,
+        **{k: v for k, v in selection.items() if k != "logical_id"},
+    }
 
     try:
-        yield pinned
+        if hasattr(proc, "cpu_affinity") and target is not None:
+            original = proc.cpu_affinity()
+            if target not in original:
+                logger.info(
+                    "Chosen core %d is outside this process's affinity mask; "
+                    "falling back to %d.", target, original[0])
+                target = original[0]
+                state["logical_id"] = target
+                state["reason"] = "chosen core was outside the process affinity mask"
+            proc.cpu_affinity([target])
+            state["pinned"] = True
+            logger.info("Pinned single-core suite to logical core %d (%s)",
+                        target, state.get("reason", ""))
+    except Exception as e:  # noqa: BLE001
+        logger.info("CPU affinity pinning unavailable on this platform: %s", e)
+        state["pinned"] = False
+        state["reason"] = f"affinity unavailable: {e}"
+
+    try:
+        yield state
     finally:
         if original is not None:
             try:
@@ -113,10 +134,10 @@ def run_single_core_suite(
     specs = registry.WORKLOADS if include_runtime_bound else registry.INDEX_WORKLOADS
 
     blas_info: List[Dict[str, Any]] = []
-    pinned = False
+    pin_state: Dict[str, Any] = {"pinned": False, "reason": "pinning disabled"}
 
-    with pinned_to_core() if pin_core else _nullcontext() as pin_state:
-        pinned = bool(pin_state)
+    with (pinned_to_core() if pin_core else _nullcontext()) as state:
+        pin_state = state
         with elevated_priority():
             # BLAS limited to one thread for the whole single-core window.
             with threadpoolctl.threadpool_limits(limits=1, user_api="blas"):
@@ -141,8 +162,16 @@ def run_single_core_suite(
     composite = geometric_mean([r.score for r in scored])
     composite_ci = combine_ci_geometric([r.score_ci_pct for r in scored])
 
+    topology = get_topology()
     meta = {
-        "core_pinned": pinned,
+        "core_pinned": bool(pin_state.get("pinned")),
+        "pinned_logical_core": pin_state.get("logical_id"),
+        "pinned_core_type": pin_state.get("core_type"),
+        "pinned_core_reason": pin_state.get("reason"),
+        "avoided_core_zero": pin_state.get("avoided_core_zero"),
+        "smt_sibling_unreserved": pin_state.get("smt_sibling"),
+        "topology": topology.to_dict(),
+        "topology_summary": topology.describe(),
         "blas_threads_limited": True,
         "blas_backends": [
             {
@@ -160,8 +189,8 @@ def run_single_core_suite(
 
 
 class _nullcontext:
-    def __enter__(self):
-        return False
+    def __enter__(self) -> Dict[str, Any]:
+        return {"pinned": False, "reason": "pinning disabled by caller"}
 
     def __exit__(self, *exc):
         return False

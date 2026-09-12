@@ -1,6 +1,6 @@
 # BenchMind Benchmark Specification
 
-Version 2.0.0 · baseline set `2.0.0`
+Version 2.0.2 · baseline set `2.0.0`
 
 This document is the contract for what a BenchMind score means. If you change
 a workload, a baseline, or a scoring rule, change this file in the same commit
@@ -197,6 +197,21 @@ python -m scripts.calibrate_baselines --reps 5
 Then bump `BASELINE_VERSION`, update this section, and note it in the
 CHANGELOG — in one commit. Scores across baseline versions are not comparable.
 
+### 4.2 The calibration spread gate
+
+`calibrate_baselines.py` **refuses** to emit a baseline block when any
+category's spread across passes exceeds `--max-spread` (default 5%).
+
+A baseline captured at 37% spread is one sample from a very wide distribution,
+and every future score in that category is then measured against a number that
+could just as easily have been 30% different. That is worse than having no
+baseline, because it looks authoritative.
+
+If the gate trips, in order of likelihood: background processes, battery or a
+balanced power plan, a machine that started warm, too few passes, or a bad
+pinned core. `--force` exists but should be used only when you can explain why
+the spread is irreducible on that machine.
+
 Never adjust a single baseline to make a score look better. That is the exact
 failure mode the project philosophy warns about.
 
@@ -324,7 +339,8 @@ Recorded honestly rather than hidden:
    Numba.
 2. **NumPy ufunc call overhead** is roughly 5–10% of the L2-resident workloads.
    It is inside the measurement.
-3. **Core pinning picks core 0**, which on a hybrid CPU may be a P-core or an
-   E-core depending on topology. Proper topology detection is not implemented.
+3. **The SMT sibling of the pinned core cannot be reserved.** Other processes
+   may be scheduled onto it, sharing execution resources with the measurement.
+   Reported, not solved.
 4. **No RAM latency, storage, or network benchmark** yet.
 5. **R1 and the GPU baselines are provisional.**

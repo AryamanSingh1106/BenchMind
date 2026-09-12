@@ -10,7 +10,7 @@
 > - `docs/BENCHMARK_SPEC.md` — methodology, baselines, scoring (**the contract**)
 > - `CHANGELOG.md` — what changed and when
 
-Version 2.0.1
+Version 2.0.2
 
 ---
 
@@ -100,6 +100,7 @@ BenchMind/
 │   ├── temp_reader.py         temperature source + circuit breaker
 │   ├── system_info.py         cross-platform identification
 │   ├── environment.py         fingerprinting
+│   ├── topology.py            P/E cores, SMT siblings, core selection
 │   └── validity.py            pre-run gate
 ├── ai/
 │   ├── stability_engine.py    repeatability and sustained performance
@@ -160,6 +161,11 @@ reintroduces the bug.
 6. **Validation must be able to fail.** Check against an independent
    reference, not just for NaN.
 7. **BLAS limited to one thread during single-core.** `threadpoolctl`, always.
+7b. **Never pin a benchmark to logical core 0.** It fields interrupts on
+    Windows and was responsible for a 37% spread on the shortest workload.
+    Core selection goes through `monitoring/topology.py`.
+7c. **Never adopt a baseline from noisy calibration data.** The spread gate in
+    `scripts/calibrate_baselines.py` enforces this; do not routinely `--force`.
 8. **Never benchmark a CPU OpenCL runtime as a GPU.** Filter on
    `CL_DEVICE_TYPE_GPU`.
 9. **GPU timing uses OpenCL event profiling**, never host wall clock.
@@ -199,14 +205,15 @@ single-file dashboard.
 **Storage** — SQLite history with fingerprint-aware regression detection.
 Supabase optional.
 
-**Tests** — 93, all passing, none timing-dependent.
+**Tests** — 106, all passing, none timing-dependent.
 
 ---
 
 ## 8. Current priority
 
 1. Run `python -m scripts.calibrate_baselines --reps 5` on a real physical
-   machine and replace reference R1.
+   machine, on mains power and starting cold, and replace reference R1. Every
+   category must clear the 5% spread gate.
 2. Run `python run.py repeat --runs 5` and confirm spread is under 2%.
 3. Run the GPU suite on the RTX 3050 and calibrate the GPU baselines.
 4. Freeze the CPU implementation; bump `BASELINE_VERSION` on any change after
@@ -215,8 +222,8 @@ Supabase optional.
 6. Storage benchmark.
 7. Native kernels (cffi or Numba) to reduce dependence on the Python stack.
 8. macOS temperature source.
-9. Per-core topology detection, so single-core pinning can target a known
-   P-core rather than logical core 0.
+9. RAM latency benchmark, to explain the low branch_heavy scores seen on
+   mobile parts.
 
 Do not jump ahead unless explicitly asked.
 

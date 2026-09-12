@@ -555,5 +555,144 @@ class TestDriftDetection(unittest.TestCase):
                         "drift must be penalised harder than equivalent scatter")
 
 
+class TestTopology(unittest.TestCase):
+    """
+    Core selection, which through 2.0.1 pinned to logical core 0 and produced a
+    37% spread on the shortest workload of a real i5-13450HX.
+    """
+
+    @staticmethod
+    def _hybrid():
+        """i5-13450HX: 6 P-cores with SMT (logical 0-11) + 4 E-cores (12-15)."""
+        from monitoring.topology import PhysicalCore, Topology
+        cores = [PhysicalCore(i, [i * 2, i * 2 + 1], efficiency_class=1, smt=True)
+                 for i in range(6)]
+        cores += [PhysicalCore(6 + i, [12 + i], efficiency_class=0, smt=False)
+                  for i in range(4)]
+        return Topology(cores, source="windows", confidence="high", hybrid=True)
+
+    def test_hybrid_classes_are_separated(self):
+        t = self._hybrid()
+        self.assertTrue(t.hybrid)
+        self.assertEqual(len(t.performance_cores), 6)
+        self.assertEqual(len(t.efficiency_cores), 4)
+        self.assertEqual(t.logical_count, 16)
+
+    def test_never_picks_core_zero_when_alternatives_exist(self):
+        from monitoring.topology import select_benchmark_core
+
+        selection = select_benchmark_core(self._hybrid())
+        self.assertNotEqual(selection["logical_id"], 0,
+                            "core 0 fields interrupts and must not be the target")
+        self.assertTrue(selection["avoided_core_zero"])
+
+    def test_picks_a_performance_core_on_hybrid(self):
+        from monitoring.topology import select_benchmark_core
+
+        selection = select_benchmark_core(self._hybrid())
+        self.assertEqual(selection["core_type"], "performance")
+        # E-cores are logical 12-15; an E-core would understate single-thread.
+        self.assertLess(selection["logical_id"], 12)
+
+    def test_reports_unreservable_smt_sibling(self):
+        from monitoring.topology import select_benchmark_core
+
+        selection = select_benchmark_core(self._hybrid())
+        self.assertIsNotNone(selection["smt_sibling"],
+                             "the sibling is a real limitation and must be reported")
+        self.assertIn("sibling", selection["reason"])
+
+    def test_single_core_machine_degrades_honestly(self):
+        from monitoring.topology import PhysicalCore, Topology, select_benchmark_core
+
+        t = Topology([PhysicalCore(0, [0])], source="linux", confidence="high")
+        selection = select_benchmark_core(t)
+        self.assertEqual(selection["logical_id"], 0)
+        self.assertFalse(selection["avoided_core_zero"])
+        self.assertIn("could not be avoided", selection["reason"])
+
+    def test_non_hybrid_picks_away_from_core_zero(self):
+        from monitoring.topology import PhysicalCore, Topology, select_benchmark_core
+
+        cores = [PhysicalCore(i, [i * 2, i * 2 + 1], smt=True) for i in range(8)]
+        t = Topology(cores, source="windows", confidence="high", hybrid=False)
+        selection = select_benchmark_core(t)
+        self.assertNotEqual(selection["logical_id"], 0)
+        self.assertEqual(selection["core_type"], "physical")
+
+    def test_empty_topology_does_not_crash(self):
+        from monitoring.topology import Topology, select_benchmark_core
+
+        selection = select_benchmark_core(Topology([], source="fallback"))
+        self.assertIsNone(selection["logical_id"])
+
+    def test_real_detection_is_self_consistent(self):
+        from monitoring.topology import get_topology
+        import psutil
+
+        t = get_topology(refresh=True)
+        self.assertGreater(len(t.physical_cores), 0)
+        self.assertIn(t.source, ("windows", "linux", "fallback"))
+        if t.confidence == "high":
+            self.assertEqual(t.logical_count, psutil.cpu_count(logical=True))
+
+    def test_suite_records_which_core_it_used(self):
+        """The result must say what was done, not what was intended."""
+        from benchmarks.cpu.single_core import run_single_core_suite
+
+        _, _, _, meta = run_single_core_suite(
+            target_duration_per_subtest=0.02, scale=0.02,
+            include_runtime_bound=False)
+
+        for key in ("core_pinned", "pinned_logical_core", "pinned_core_reason",
+                    "topology_summary", "avoided_core_zero"):
+            self.assertIn(key, meta)
+
+
+class TestCalibrationSpreadGate(unittest.TestCase):
+    """
+    A baseline captured from noisy data permanently miscalibrates its category,
+    so the calibration script must refuse rather than warn.
+    """
+
+    def test_real_noisy_calibration_is_rejected(self):
+        from scripts.calibrate_baselines import evaluate_spreads
+
+        # The actual first calibration attempt on an i5-13450HX, pinned to core 0.
+        measured = {
+            "integer": 36.92, "floating_point": 8.38, "matrix": 1.18,
+            "vector_simd": 5.32, "compression": 5.43, "hashing": 2.89,
+            "branch_heavy": 10.74, "interpreter": 3.13,
+        }
+        gate = evaluate_spreads(measured, [], max_spread=5.0)
+
+        self.assertFalse(gate["acceptable"])
+        self.assertIn("integer", gate["noisy"])
+        # Worst offender must be listed first so the user knows where to look.
+        self.assertEqual(next(iter(gate["noisy"])), "integer")
+        self.assertEqual(gate["worst_spread_pct"], 36.92)
+
+    def test_clean_calibration_is_accepted(self):
+        from scripts.calibrate_baselines import evaluate_spreads
+
+        clean = {"integer": 1.9, "matrix": 1.18, "hashing": 2.4}
+        self.assertTrue(evaluate_spreads(clean, [], max_spread=5.0)["acceptable"])
+
+    def test_missing_measurements_block_emission(self):
+        """A category that never validated must not silently keep an old baseline."""
+        from scripts.calibrate_baselines import evaluate_spreads
+
+        gate = evaluate_spreads({"matrix": 1.0}, ["integer"], max_spread=5.0)
+        self.assertFalse(gate["acceptable"])
+        self.assertIn("integer", gate["missing"])
+
+    def test_threshold_is_configurable(self):
+        from scripts.calibrate_baselines import evaluate_spreads
+
+        spreads = {"integer": 4.0}
+        self.assertTrue(evaluate_spreads(spreads, [], max_spread=5.0)["acceptable"])
+        self.assertFalse(evaluate_spreads(spreads, [], max_spread=3.0)["acceptable"])
+
+
 if __name__ == "__main__":
     unittest.main()

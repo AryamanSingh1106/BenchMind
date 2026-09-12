@@ -1,5 +1,54 @@
 # Changelog
 
+## 2.0.2
+
+Prompted by the first real calibration run on an i5-13450HX, which produced
+spreads that tracked workload duration almost exactly:
+
+    integer          2,019.90 Mops/sec   spread 36.92%   (shortest workload)
+    branch_heavy        29.20 Mops/sec   spread 10.74%
+    floating_point   3,393.07 MFLOPS     spread  8.38%
+    matrix              45.86 GFLOPS     spread  1.18%   (longest workload)
+
+That pattern is the signature of periodic interference being averaged out by
+longer runs, and the cause was BenchMind's own core selection.
+
+### Single-core pinning no longer targets core 0
+
+Through 2.0.1, `pinned_to_core()` used `cpu_affinity()[0]` — logical core 0,
+which is the worst available choice on Windows for two independent reasons:
+it fields a disproportionate share of interrupts and DPCs, and on a hybrid part
+it is an SMT sibling sharing a physical core with logical 1.
+
+- New `monitoring/topology.py` detects physical cores, SMT siblings and
+  performance-versus-efficiency classes. Windows uses
+  `GetLogicalProcessorInformationEx`, where `EfficiencyClass` is the only
+  reliable way to tell a P-core from an E-core — core numbering order is not
+  guaranteed. Linux reads sysfs `thread_siblings_list` and `cpu_capacity`.
+  A count-based fallback exists and is marked low confidence.
+- `select_benchmark_core()` prefers a performance core, avoids core 0, and
+  takes the highest-numbered candidate.
+- The result records which core was used, its type, whether core 0 was avoided,
+  the SMT sibling that could not be reserved, and the detection confidence. The
+  report says what was done, not what was intended.
+
+### Calibration refuses noisy baselines
+
+`calibrate_baselines.py` now emits nothing when any category exceeds
+`--max-spread` (default 5%), listing the offenders worst-first with concrete
+remedies. A baseline captured from noisy data permanently miscalibrates its
+category and looks authoritative while doing so. The gate logic is a pure
+function, `evaluate_spreads()`, tested against the real 36.92% failure above.
+
+The emitted block now annotates each baseline with its spread and pass count,
+and the recorded reference metadata includes topology and pinned core.
+
+### Elsewhere
+
+- `.gitattributes` normalises line endings, silencing the CRLF warnings on
+  every Windows commit and keeping a Linux checkout byte-identical.
+- 106 tests, up from 93.
+
 ## 2.0.1
 
 Three fixes, all prompted by the same real run on a Lenovo i5-13450HX laptop
