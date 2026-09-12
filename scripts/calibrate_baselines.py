@@ -69,7 +69,7 @@ def evaluate_spreads(spreads: Dict[str, float], missing: List[str],
     }
 
 
-def calibrate(reps: int = 5, mode_target: float = 0.8,
+def calibrate(reps: int = 5, mode_target: float = 1.5,
               max_spread: float = 5.0, force: bool = False) -> Dict[str, float]:
     from benchmarks.cpu import registry
     from benchmarks.cpu.common import run_timed_subtest
@@ -99,6 +99,7 @@ def calibrate(reps: int = 5, mode_target: float = 0.8,
     print(f"Pinning to logical core {selection['logical_id']} ({selection['reason']})\n")
 
     measurements: Dict[str, List[float]] = {w.category: [] for w in registry.WORKLOADS}
+    short_reps: set = set()
 
     with pinned_to_core():
         with elevated_priority():
@@ -110,6 +111,8 @@ def calibrate(reps: int = 5, mode_target: float = 0.8,
                                                    target_duration=mode_target)
                         if result.validation_passed:
                             measurements[spec.category].append(result.raw_metric_value)
+                            if result.short_rep_warning:
+                                short_reps.add(spec.category)
                         else:
                             print(f"    ! {spec.category} failed validation: "
                                   f"{result.error_message}")
@@ -130,6 +133,8 @@ def calibrate(reps: int = 5, mode_target: float = 0.8,
         baselines[spec.category] = round(median, 2)
         spreads[spec.category] = spread
         flag = "  <-- TOO NOISY" if spread > max_spread else ""
+        if spec.category in short_reps:
+            flag += "  [repetitions too short to be stable]"
         print(f"  {spec.category:<16} {median:>12,.2f} {spec.raw_metric_name:<10} "
               f"spread {spread:>6.2f}%{flag}")
     print("-" * 70)

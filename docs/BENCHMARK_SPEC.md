@@ -1,6 +1,6 @@
 # BenchMind Benchmark Specification
 
-Version 2.0.2 · baseline set `2.0.0`
+Version 2.1.0 · baseline set `2.1.0`
 
 This document is the contract for what a BenchMind score means. If you change
 a workload, a baseline, or a scoring rule, change this file in the same commit
@@ -78,7 +78,7 @@ Each workload verifies against an independently computed reference:
 | vector_simd | result mean must land inside the analytic bounds |
 | compression | SHA-256 round trip on both codecs, plus a compression-ratio sanity bound |
 | hashing | digests compared against values computed in `setup` |
-| branch_heavy | element sum preserved through the sort, gather sum matches reference |
+| branch_heavy | ordering, exact int64 element sum, every search result a valid insertion point, gather sum |
 | interpreter | π(300000) = 25997 |
 
 The test suite (`tests/test_workloads.py`) corrupts each output and asserts the
@@ -105,8 +105,8 @@ PID, and each worker builds and caches its workload context, all before the
 
 | Key | Profile | Metric | Working set | Notes |
 |---|---|---|---|---|
-| `integer` | compute_bound | Mops/sec | 4 × 512 KB int64 | 6 int64 ops per element per pass, in place |
-| `floating_point` | compute_bound | MFLOPS | ~768 KB | L2-resident FMA, FP32 + FP64 |
+| `integer` | compute_bound | Mops/sec | 1.00 MB (4 × int64 × 32,768) | 6 int64 ops per element per pass, in place |
+| `floating_point` | compute_bound | MFLOPS | 1.13 MB | L2-resident FMA, FP32 + FP64 |
 | `matrix` | mixed | GFLOPS | 3 × 4.5 MB f64 | 768×768 dgemm through BLAS |
 | `vector_simd` | memory_bound | GFLOPS | 5 × 32 MB f32 | DRAM-resident streaming FMA |
 | `compression` | compression | MB/s | 8 MB corpus | zlib level 6 + bz2 level 5, round trip |

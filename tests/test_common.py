@@ -201,6 +201,75 @@ class TestTimedRunner(unittest.TestCase):
         self.assertIn("allocation failed", result.error_message)
         self.assertEqual(result.score, 0.0)
 
+    def test_warmup_runs_for_a_minimum_duration(self):
+        """
+        A single warmup repetition is enough for a 500 ms workload and useless
+        for a 10 ms one: a laptop CPU takes hundreds of milliseconds to settle
+        from peak turbo toward its sustained clock.
+        """
+        import time
+        from benchmarks.cpu.common import WARMUP_MIN_SECONDS, WorkloadSpec
+
+        spec = WorkloadSpec(
+            key="tiny", name="Tiny", category="integer",
+            workload_profile="compute_bound", raw_metric_name="ops/sec",
+            setup_fn=lambda s: {}, run_fn=lambda c: (time.sleep(0.002) or {}, 100.0),
+            validate_fn=lambda o: True,
+        )
+        result = run_timed_subtest(spec, target_duration=0.05, min_reps=3, max_reps=5)
+
+        self.assertGreater(result.warmup_reps, 1,
+                           "a 2 ms workload needs many warmup reps, not one")
+        self.assertGreaterEqual(result.warmup_time, WARMUP_MIN_SECONDS * 0.8)
+
+    def test_warmup_is_not_charged_to_the_metric(self):
+        from benchmarks.cpu.common import WorkloadSpec
+
+        spec = WorkloadSpec(
+            key="probe2", name="Probe2", category="integer",
+            workload_profile="compute_bound", raw_metric_name="ops/sec",
+            setup_fn=lambda s: {}, run_fn=lambda c: ({}, 1000.0),
+            validate_fn=lambda o: True,
+        )
+        result = run_timed_subtest(spec, target_duration=0.02, min_reps=3, max_reps=4)
+        self.assertGreater(result.warmup_time, 0.0)
+        self.assertLess(result.median_time, result.warmup_time,
+                        "warmup time must be separate from the timed repetitions")
+
+    def test_short_repetitions_are_flagged(self):
+        """
+        No amount of repetition fixes a structurally noisy measurement, so the
+        result must say when its repetitions are too brief to be stable.
+        """
+        from benchmarks.cpu.common import WorkloadSpec
+
+        spec = WorkloadSpec(
+            key="instant", name="Instant", category="integer",
+            workload_profile="compute_bound", raw_metric_name="ops/sec",
+            setup_fn=lambda s: {}, run_fn=lambda c: ({}, 1.0),
+            validate_fn=lambda o: True,
+        )
+        result = run_timed_subtest(spec, target_duration=0.02, min_reps=5, max_reps=6)
+        self.assertTrue(result.short_rep_warning)
+
+    def test_real_workloads_have_useful_repetition_lengths(self):
+        """
+        Every shipped workload must have repetitions above the stability floor.
+        This is the test that would have caught integer and floating_point
+        sitting at ~10-20 ms, where their spread was 15% and 7%.
+        """
+        from benchmarks.cpu.common import MIN_USEFUL_REP_SECONDS
+
+        for key in ("integer", "floating_point", "matrix"):
+            with self.subTest(workload=key):
+                spec = registry.get(key)
+                result = run_timed_subtest(spec, scale=1.0, target_duration=0.3,
+                                           min_reps=3, max_reps=4)
+                self.assertTrue(result.validation_passed)
+                self.assertGreaterEqual(
+                    result.median_time, MIN_USEFUL_REP_SECONDS * 0.75,
+                    f"{key} repetitions are too short to measure stably")
+
     def test_reports_confidence_interval(self):
         spec = registry.get("integer")
         result = run_timed_subtest(spec, scale=0.05, target_duration=0.05,

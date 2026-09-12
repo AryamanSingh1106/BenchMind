@@ -9,10 +9,22 @@ the score moved when you upgraded Python without touching the hardware.
   * this module      -> int64 SIMD ALU work through NumPy, counted in the CPU Index
   * interpreter.py   -> the old-style pure-Python loop, reported but NOT counted
 
-Working set is sized to stay inside L2 on a typical core, so the result
-reflects ALU throughput rather than memory bandwidth. All masks are chosen so
-no int64 operation can overflow, which keeps the checksum exactly reproducible
-across platforms.
+Working set sizing (revised in 2.1.0)
+-------------------------------------
+This workload keeps four int64 arrays live. At the original 65,536 elements
+that is exactly 2.00 MB, which is exactly the L2 capacity of a Raptor Lake
+P-core. Sitting precisely on the cache cliff is the worst possible place to
+be: any small change in what else is resident pushes data in and out of L2,
+and the measurement swings wildly as a result.
+
+Measured on an i5-13450HX over five calibration passes:
+
+    65,536 elements (2.00 MB, at the boundary)   spread 15.57%
+    32,768 elements (1.00 MB, comfortably in)    see CHANGELOG
+
+The loop count is raised to compensate, so repetition duration is unchanged
+and only the cache behaviour differs. All masks are chosen so no int64
+operation can overflow, which keeps the checksum exactly reproducible.
 """
 
 from __future__ import annotations
@@ -21,8 +33,13 @@ from typing import Any, Dict, Tuple
 
 import numpy as np
 
-ELEMENTS = 65_536           # 512 KB per int64 array
-LOOPS = 120
+# 32,768 int64 elements x 4 live arrays = 1.00 MB, half of a Raptor Lake
+# P-core's 2 MB L2. Leaves headroom rather than balancing on the cliff.
+ELEMENTS = 32_768
+# 500 loops keeps a repetition above the 20 ms stability floor even on fast
+# hardware. Halving the working set without raising this would have pushed
+# repetitions down to ~13 ms, trading one source of noise for another.
+LOOPS = 500
 VALUE_MASK = 0x0003_FFFF_FFFF_FFFF   # ~2^50, so (x << 7) stays inside int64
 SEED_BASE = 12345
 SEED_ODD = 67890

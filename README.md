@@ -129,7 +129,7 @@ Interactive docs at `/docs`.
 python -m unittest discover -s tests
 ```
 
-93 tests, none of them timing-dependent — CI runners are noisy shared VMs and
+110 tests, none of them timing-dependent — CI runners are noisy shared VMs and
 asserting on speed there produces flaky failures that teach people to ignore
 the suite. Speed is verified by `scripts/repeatability.py` on real hardware.
 

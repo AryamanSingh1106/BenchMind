@@ -125,13 +125,34 @@ class TestValidatorsCatchCorruption(unittest.TestCase):
                          "a correctly shaped but wrong digest must be rejected")
 
     def test_branch_heavy_detects_lost_elements(self):
+        """
+        Corrupt the sorted buffer itself, not a precomputed summary. Since 2.1.0
+        `run` returns buffers by reference and all reductions happen in
+        `validate`, so this exercises the real verification path.
+        """
+        import numpy as np
         from benchmarks.cpu import branch_heavy
+
         ctx = branch_heavy.setup(SMALL_SCALE)
         output, _ = branch_heavy.run(ctx)
         self.assertTrue(branch_heavy.validate(output))
 
-        output["sorted_sum"] += 1
-        self.assertFalse(branch_heavy.validate(output))
+        # Alter one element: breaks both the ordering and the exact sum.
+        corrupted = dict(output)
+        work = output["work_out"].copy()
+        work[len(work) // 2] += 1
+        corrupted["work_out"] = work
+        self.assertFalse(branch_heavy.validate(corrupted))
+
+        # An out-of-range search result must also be caught.
+        bad_positions = dict(output)
+        bad_positions["positions_out"] = np.full(8, 10 ** 12, dtype=np.intp)
+        self.assertFalse(branch_heavy.validate(bad_positions))
+
+        # And a wrong gather sum.
+        bad_gather = dict(output)
+        bad_gather["expected_gather"] = output["expected_gather"] * 1.01
+        self.assertFalse(branch_heavy.validate(bad_gather))
 
     def test_floating_point_detects_divergence(self):
         from benchmarks.cpu import floating_point

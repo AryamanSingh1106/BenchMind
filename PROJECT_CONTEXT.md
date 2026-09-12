@@ -10,7 +10,7 @@
 > - `docs/BENCHMARK_SPEC.md` — methodology, baselines, scoring (**the contract**)
 > - `CHANGELOG.md` — what changed and when
 
-Version 2.0.2
+Version 2.1.0
 
 ---
 
@@ -166,6 +166,11 @@ reintroduces the bug.
     Core selection goes through `monitoring/topology.py`.
 7c. **Never adopt a baseline from noisy calibration data.** The spread gate in
     `scripts/calibrate_baselines.py` enforces this; do not routinely `--force`.
+7d. **Never size a cache-resident working set at the cache capacity.** Target
+    half of it. Straddling the boundary caused a 15% spread on `integer`.
+7e. **Watch for implicit allocation in the timed region.** `np.searchsorted(...)`
+    and `arr[idx]` allocate their results; only `out=` parameters avoid it.
+    Reductions and verification belong in `validate`, not `run`.
 8. **Never benchmark a CPU OpenCL runtime as a GPU.** Filter on
    `CL_DEVICE_TYPE_GPU`.
 9. **GPU timing uses OpenCL event profiling**, never host wall clock.
@@ -205,7 +210,7 @@ single-file dashboard.
 **Storage** — SQLite history with fingerprint-aware regression detection.
 Supabase optional.
 
-**Tests** — 106, all passing, none timing-dependent.
+**Tests** — 110, all passing, none timing-dependent.
 
 ---
 

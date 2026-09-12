@@ -13,6 +13,19 @@ Design rules enforced here (see docs/BENCHMARK_SPEC.md):
 2.  `time.perf_counter()` is the ONLY clock used for performance measurement.
     `time.monotonic()` is reserved for telemetry windowing.
 
+2b. WARMUP IS A DURATION, NOT A REPETITION COUNT (2.1.0).
+    A single warmup repetition is enough for a 500 ms workload and useless for
+    a 10 ms one. A modern laptop CPU bursts to its maximum turbo and then
+    settles toward a sustained clock over hundreds of milliseconds, so a short
+    workload with one warmup rep samples a different point on that ramp every
+    time. Warmup now runs until at least WARMUP_MIN_SECONDS has elapsed.
+
+2c. REPETITIONS THAT ARE TOO SHORT ARE FLAGGED (2.1.0).
+    Below MIN_USEFUL_REP_SECONDS a repetition cannot average out OS scheduling
+    quanta, interrupts or clock transitions, and no amount of repetition fixes
+    a structurally noisy measurement. The result says so rather than reporting
+    a confident-looking number.
+
 3.  Every measurement reports a confidence interval.
     A score without a spread is not a measurement, it is a number.
 
@@ -39,7 +52,19 @@ logger = logging.getLogger("BenchMind.CPU.Common")
 # make results look nice -- if you recalibrate them, update the spec and the
 # CHANGELOG in the same commit.
 REFERENCE_MACHINE = "BenchMind Reference R1 (see docs/BENCHMARK_SPEC.md)"
-BASELINE_VERSION = "2.0.0"
+
+# Bumped in 2.1.0: the integer and floating_point working sets were resized to
+# fit inside a 2 MB L2 instead of straddling it, so their raw metrics are not
+# comparable to anything measured under 2.0.x.
+BASELINE_VERSION = "2.1.0"
+
+# Warmup runs until this much time has elapsed, not for a fixed rep count.
+WARMUP_MIN_SECONDS = 0.25
+WARMUP_MAX_REPS = 500
+
+# A repetition shorter than this cannot average out scheduling quanta and
+# clock transitions. Flagged, not silently accepted.
+MIN_USEFUL_REP_SECONDS = 0.020
 
 # Every number below is the median single-thread raw metric actually measured
 # on reference machine R1, whose full specification and environment
@@ -91,6 +116,9 @@ class SubtestResult:
     score_ci_pct: float = 0.0        # +/- half-width of the 95% CI, percent
     raw_metric_ci_pct: float = 0.0
     setup_time: float = 0.0          # untimed setup cost, reported for transparency
+    warmup_time: float = 0.0         # untimed warmup cost
+    warmup_reps: int = 0
+    short_rep_warning: bool = False   # repetitions too brief to be stable
     arithmetic_intensity: float = 0.0  # work units per byte moved (roofline input)
     bytes_moved: float = 0.0
     working_set_bytes: float = 0.0
@@ -307,13 +335,23 @@ def run_timed_subtest(
         logger.error("Subtest '%s' failed during setup: %s", spec.name, e, exc_info=True)
         return _failed_result(spec, time.perf_counter() - subtest_start, f"Setup error: {e}")
 
-    # 2. Untimed warmup
+    # 2. Untimed warmup, run for a minimum DURATION rather than a fixed count.
+    #    This is what gets a short workload past the CPU's turbo ramp before
+    #    any of its repetitions are timed.
+    warmup_reps = 0
+    warmup_start = time.perf_counter()
     try:
-        last_output, _ = spec.run_fn(ctx)
+        while True:
+            last_output, _ = spec.run_fn(ctx)
+            warmup_reps += 1
+            elapsed = time.perf_counter() - warmup_start
+            if elapsed >= WARMUP_MIN_SECONDS or warmup_reps >= WARMUP_MAX_REPS:
+                break
     except Exception as e:  # noqa: BLE001
         logger.error("Subtest '%s' failed during warmup: %s", spec.name, e, exc_info=True)
         return _failed_result(spec, time.perf_counter() - subtest_start,
                               f"Warmup error: {e}", setup_time)
+    warmup_time = time.perf_counter() - warmup_start
 
     # 3. Timed repetitions
     run_times: List[float] = []
@@ -366,6 +404,14 @@ def run_timed_subtest(
 
     score = calculate_subtest_score(spec.category, raw_metric_value) if validation_passed else 0.0
 
+    short_rep = median_time < MIN_USEFUL_REP_SECONDS
+    if short_rep:
+        logger.warning(
+            "Subtest '%s' has a median repetition of %.1f ms, below the %.0f ms "
+            "floor. Its spread will be dominated by scheduling noise rather than "
+            "by the hardware; raise its loop count.",
+            spec.name, median_time * 1000, MIN_USEFUL_REP_SECONDS * 1000)
+
     return SubtestResult(
         name=spec.name,
         category=spec.category,
@@ -384,6 +430,9 @@ def run_timed_subtest(
         score_ci_pct=ci_pct,
         raw_metric_ci_pct=ci_pct,
         setup_time=round(setup_time, 6),
+        warmup_time=round(warmup_time, 6),
+        warmup_reps=warmup_reps,
+        short_rep_warning=short_rep,
         arithmetic_intensity=spec.arithmetic_intensity,
         bytes_moved=spec.bytes_per_run * scale,
         working_set_bytes=spec.working_set_bytes * scale,

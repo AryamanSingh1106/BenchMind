@@ -6,9 +6,14 @@ million random numbers *inside* the timed region, then did 20 cheap passes over
 them. Most of the measured time was the RNG, and the arrays were far too large
 to sit in cache, so the number reported as MFLOPS was really DRAM bandwidth.
 
-2.0 sizes the working set to roughly 768 KB so it stays in L2 on a typical
-core, runs many more passes, and does all arithmetic in place with `out=`
-so nothing is allocated while the clock is running.
+2.0 split setup from the timed region and did all arithmetic in place with
+`out=`, so nothing is allocated while the clock is running.
+
+2.1.0 fixed the sizing. Three FP32 plus three FP64 arrays at 65,536 elements
+is 2.25 MB, which OVERFLOWS the 2 MB L2 of a Raptor Lake P-core -- so the
+"L2-resident" workload was partly DRAM-bound and, worse, was balanced on the
+cache cliff where the measurement is at its least stable. It showed a 7.45%
+spread on an i5-13450HX while matrix managed 0.22%.
 
 Pair this with vector_simd.py, which deliberately uses a DRAM-sized working
 set. The two together tell you where the machine falls off the cache cliff.
@@ -20,8 +25,12 @@ from typing import Any, Dict, Tuple
 
 import numpy as np
 
-ELEMENTS = 65_536      # 256 KB as float32, 512 KB as float64
-LOOPS = 150
+# 32,768 elements x (3 x fp32 + 3 x fp64) = 1.13 MB, comfortably inside a
+# 2 MB L2. The loop count is raised so repetition duration goes UP rather
+# than down: a 10 ms repetition is too short to average out interference.
+ELEMENTS = 32_768
+# See integer.py: sized so a repetition stays above the 20 ms floor.
+LOOPS = 1200
 
 
 def setup(scale: float = 1.0) -> Dict[str, Any]:

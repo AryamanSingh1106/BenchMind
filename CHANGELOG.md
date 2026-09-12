@@ -1,5 +1,84 @@
 # Changelog
 
+## 2.1.0
+
+**Baseline version bumped to `2.1.0`. Scores are not comparable to 2.0.x.**
+Two workloads were resized, so their raw metrics mean something different.
+
+Prompted by the 2.0.2 calibration on an i5-13450HX. Fixing core selection had
+cleaned up five categories but left three noisy, and the pattern pointed
+somewhere specific:
+
+    matrix            0.22%      compression      0.16%     interpreter  0.16%
+    vector_simd       1.06%      hashing          1.44%
+    floating_point    7.45%  <-- branch_heavy     9.80%  <-- integer  15.57%  <--
+
+### The two worst offenders were balanced on the L2 cache cliff
+
+A Raptor Lake P-core has exactly 2 MB of L2. Measured working sets:
+
+    integer          4 x int64 x 65,536       = 2.00 MB   exactly at the limit
+    floating_point   (3 fp32 + 3 fp64) x 65k  = 2.25 MB   over the limit
+
+Sitting precisely on the cliff is the worst possible place to be: any small
+change in what else is resident pushes data in and out of L2 and the
+measurement swings. It also meant the workload documented as "L2-resident" was
+partly DRAM-bound.
+
+- `integer` is now 32,768 elements (1.00 MB), loops raised 120 → 500.
+- `floating_point` is now 32,768 elements (1.13 MB), loops raised 150 → 1200.
+
+Loop counts went up rather than down deliberately, so repetition duration
+increased. Halving the working set alone would have dropped repetitions to
+~13 ms, trading one source of noise for another.
+
+### branch_heavy was allocating 16 MB per repetition, inside the timed region
+
+`np.searchsorted(table, keys)` and `gather_src[gather_idx]` each returned a
+fresh 8 MB array on every repetition. The setup/run split was supposed to
+eliminate exactly this, but these allocations were implicit in NumPy's return
+values rather than visible `np.empty` calls, which is why they survived the
+2.0.0 audit.
+
+- Results now go into buffers allocated in `setup`; the gather uses
+  `np.take(..., out=)`.
+- The binary search is chunked at 64 K so its intermediate stays cache-resident
+  and the allocator reuses one block instead of requesting 8 MB each time.
+- The sortedness check and four array-wide reductions also ran inside `run`,
+  charging verification to the measurement. `run` now returns buffers by
+  reference and `validate` does the reductions after the clock stops.
+- Validation got stronger as a side effect: it now checks ordering, the exact
+  int64 element sum, that every search result is a valid insertion point, and
+  the gather sum.
+
+### Warmup is a duration, not a repetition count
+
+One warmup repetition is enough for a 500 ms workload and useless for a 10 ms
+one. A laptop CPU bursts to maximum turbo and settles toward its sustained
+clock over hundreds of milliseconds, so a short workload with a single warmup
+rep sampled a different point on that ramp every pass.
+
+- Warmup now runs until `WARMUP_MIN_SECONDS` (250 ms) has elapsed. In practice
+  `integer` now gets ~11 warmup reps where it previously got 1.
+- `warmup_time` and `warmup_reps` are reported per subtest.
+
+### Repetitions that are too short are flagged
+
+Below `MIN_USEFUL_REP_SECONDS` (20 ms) a repetition cannot average out
+scheduling quanta, interrupts or clock transitions, and no amount of repetition
+fixes a structurally noisy measurement.
+
+- `short_rep_warning` is set on the result and logged.
+- Calibration marks the category in its output.
+- A test asserts every shipped workload clears the floor. It immediately caught
+  both resized workloads sitting at ~13 ms on fast hardware, which is how the
+  loop counts above were chosen rather than guessed.
+
+### Elsewhere
+
+- Calibration `target_duration` raised 0.8 s → 1.5 s per subtest.
+- 110 tests, up from 106.
+
 ## 2.0.2
 
 Prompted by the first real calibration run on an i5-13450HX, which produced
