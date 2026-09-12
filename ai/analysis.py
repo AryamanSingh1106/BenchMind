@@ -370,3 +370,96 @@ def analyze_scaling(scaling: Optional[Dict[str, Any]]) -> Dict[str, Any]:
 
     return {"verdict": verdict, "summary": summary,
             "saturation_threads": saturation, "efficiency_at_max": efficiency}
+
+
+def analyze_memory_hierarchy(hierarchy: Optional[Dict[str, Any]],
+                             subtests: Optional[List[Dict[str, Any]]] = None
+                             ) -> Dict[str, Any]:
+    """
+    Turn the hierarchy sweep into a plain-language reading, and connect it to
+    the `branch_heavy` score if that is available.
+
+    This is the analysis the sweep exists for. `branch_heavy` scores low on
+    mobile parts and nothing else in the suite explains why: `vector_simd`
+    measures streaming bandwidth, which can be healthy while random access is
+    not. The cliff ratio separates those two cases.
+    """
+    if not hierarchy or not hierarchy.get("points"):
+        return {"verdict": "not_measured",
+                "summary": "The memory hierarchy sweep was not run."}
+
+    points = hierarchy["points"]
+    # Prefer the overhead-corrected ratio. The raw one includes NumPy's
+    # per-lookup cost at both ends, which compresses it: on one machine the
+    # raw figure read 2.35x where the corrected read 14.3x, and the raw
+    # version would have called a latency-limited machine "normal".
+    ratio = hierarchy.get("cache_cliff_ratio_corrected") or hierarchy.get("cache_cliff_ratio")
+    raw_ratio = hierarchy.get("cache_cliff_ratio")
+    overhead = hierarchy.get("overhead_ns_per_lookup")
+    cached_ns = hierarchy.get("cached_ns_per_lookup")
+    dram_ns = hierarchy.get("dram_ns_per_lookup")
+    boundaries = hierarchy.get("boundaries", [])
+
+    parts = []
+    if cached_ns and dram_ns:
+        parts.append(
+            f"Random access costs {cached_ns:.1f} ns per lookup in cache and "
+            f"{dram_ns:.1f} ns at a {points[-1]['size_mb']:.0f} MB working set")
+    if ratio:
+        spread = f"a {ratio:.1f}x spread across the hierarchy"
+        if raw_ratio and overhead and abs(raw_ratio - ratio) > 0.1:
+            spread += (f" once NumPy's {overhead:.1f} ns per-lookup overhead is "
+                       f"removed ({raw_ratio:.1f}x before correction)")
+        parts.append(spread)
+
+    if boundaries:
+        edges = ", ".join(
+            f"{b['between_mb'][0]:.0f}-{b['between_mb'][1]:.0f} MB (-{b['drop_pct']:.0f}%)"
+            for b in boundaries)
+        parts.append(f"clear boundaries at {edges}")
+    else:
+        parts.append("no sharp boundary resolved, which suggests a gradual "
+                     "cache hierarchy or a working set that never left cache")
+
+    if ratio is None:
+        verdict = "unknown"
+    elif ratio >= 8.0:
+        verdict = "latency_limited"
+    elif ratio >= 3.0:
+        verdict = "normal"
+    else:
+        verdict = "flat"
+
+    summary = ". ".join(p[0].upper() + p[1:] for p in parts) + "."
+
+    # Tie it to branch_heavy, which is the workload this explains.
+    branch_note = None
+    if subtests:
+        branch = next((s for s in subtests
+                       if s.get("category") == "branch_heavy"
+                       and s.get("threads", 1) == 1
+                       and s.get("validation_passed")), None)
+        if branch and ratio:
+            if verdict == "latency_limited":
+                branch_note = (
+                    f"This is the likely explanation for the branch_heavy score of "
+                    f"{branch.get('score', 0):,.0f}: that workload is a sort plus a "
+                    "binary search into a table far larger than cache plus a permuted "
+                    "gather, so it pays the DRAM-level access cost on almost every "
+                    "operation. Streaming bandwidth can look healthy while random "
+                    "access does not.")
+            else:
+                branch_note = (
+                    f"Random-access cost looks normal for this class of machine, so "
+                    f"the branch_heavy score of {branch.get('score', 0):,.0f} is not "
+                    "explained by the memory hierarchy alone.")
+
+    return {
+        "verdict": verdict,
+        "summary": summary,
+        "cache_cliff_ratio": ratio,
+        "cache_cliff_ratio_raw": raw_ratio,
+        "overhead_ns_per_lookup": overhead,
+        "boundaries": boundaries,
+        "branch_heavy_note": branch_note,
+    }

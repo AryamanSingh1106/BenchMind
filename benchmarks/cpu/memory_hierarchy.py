@@ -1,0 +1,310 @@
+"""
+benchmarks/cpu/memory_hierarchy.py
+
+Memory hierarchy sweep — the "memory mountain".
+
+Why this is not a latency benchmark
+-----------------------------------
+The obvious way to explain a low `branch_heavy` score is to measure memory
+latency directly, with a pointer chase: a permuted cycle of indices where each
+load depends on the previous one, so nothing can be overlapped.
+
+That cannot be done honestly in NumPy. A pointer chase is inherently serial,
+so the loop has to run at Python level, and the result is dominated by
+interpreter dispatch — roughly 50 ns per iteration of overhead against a
+memory latency of 1 to 100 ns. The measurement would be of CPython, not of
+the memory subsystem, and BenchMind already has a category for that.
+
+So this measures the hierarchy *curve* instead: random-access throughput as
+the working set grows past each cache level. The knees in that curve are the
+cache boundaries, and the ratio between the top and bottom of the curve is
+the cache cliff. That is a real, defensible measurement of the same
+underlying property, and it is what `branch_heavy` is actually sensitive to.
+
+Two limitations, stated rather than hidden
+------------------------------------------
+**The index array occupies cache.** 128K int32 indices is 512 KB, so the L1
+boundary is not visible and L2 is partly obscured. The sweep starts at 512 KB
+for that reason.
+
+**Index bounds checking used to set a floor, and no longer does.** `np.take`
+defaults to `mode='raise'`, which validates every index. Measured on an
+i5-13450HX that check costs about 6.3 ns per lookup against roughly 0.9 ns for
+the gather itself.
+
+The consequence was severe: the sweep's smallest working set measured 7.05 ns
+per lookup where an L2-resident random access should be nearer 1-2 ns, the
+whole dynamic range was compressed into a 2.2x cliff where real hardware shows
+5-10x, and the cache-resident end of the curve was entirely unmeasurable.
+
+Since every index is generated in range by construction, the check can never
+fire, and `mode='wrap'` produces identical results without it. The residual
+floor is still measured and reported, but it is now small enough that the
+whole hierarchy is visible.
+
+This is why the first attempt at this file concluded a C extension was
+needed. It wasn't; the measurement was being dominated by a redundant safety
+check that a single keyword removes.
+
+This is a diagnostic, not a scored workload. It is deliberately NOT in the
+CPU Index: adding it would change the index's meaning and invalidate every
+stored baseline, for information that is more useful as a curve than as a
+single number.
+
+A note on how the first version of this file was wrong
+-----------------------------------------------------
+The initial sweep produced a curve where 4 MB measured FASTER than 0.5 MB,
+which is impossible for a memory effect. Two causes, both already familiar
+from elsewhere in this codebase:
+
+  * each timed pass was a single gather taking about 0.8 ms, far below the
+    20 ms floor that `common.py` establishes for a stable measurement
+  * two warmup gathers is under 2 ms of warmup, against a CPU that needs
+    hundreds of milliseconds to reach a steady clock — so the early sizes,
+    measured first, were measured at a low clock
+
+That is the same defect as the CPU short-repetition problem fixed in 2.1.0
+and the GPU single-launch warmup problem fixed in 2.2.1. It has now appeared
+three times in independently written code, which is why both fixes below are
+structural: a sweep-level warmup burn, and per-pass work sized to clear the
+floor.
+"""
+
+from __future__ import annotations
+
+import logging
+import statistics
+import time
+from typing import Any, Dict, List, Optional
+
+import numpy as np
+
+logger = logging.getLogger("BenchMind.MemoryHierarchy")
+
+# Working-set sizes in MB. Starts at 512 KB because the index array below
+# occupies enough cache to obscure anything smaller.
+SWEEP_SIZES_MB: List[float] = [0.5, 1, 2, 4, 8, 16, 32, 64, 128, 256]
+
+# Number of random lookups per gather. int32 indices, so 128K lookups is a
+# 512 KB index array: small enough not to dominate cache, large enough to
+# amortize NumPy call overhead.
+LOOKUPS = 128 * 1024
+REPS = 7
+
+# One gather takes well under a millisecond, so each timed pass repeats it
+# until it clears the stability floor. Without this the sweep measures
+# scheduling noise and clock transitions instead of the memory hierarchy.
+TARGET_PASS_SECONDS = 0.025
+
+# The whole sweep is preceded by this much untimed work, so the first sizes
+# measured are not measured at idle clock.
+SWEEP_WARMUP_SECONDS = 0.40
+BYTES_PER_ELEMENT = 8          # int64 payload
+
+# Index validation mode.
+#
+# `np.take` defaults to mode='raise', which bounds-checks every index. On an
+# i5-13450HX that check costs about 6.3 ns per lookup against roughly 0.9 ns
+# for the gather itself -- so the default mode spends 86% of its time
+# validating indices rather than touching memory.
+#
+# Every index here is generated by `rng.integers(0, n)` and is in range by
+# construction, so the check can never fire. 'wrap' produces identical results
+# and skips it.
+GATHER_MODE = "wrap"
+
+# A drop this large between adjacent sizes is treated as a cache boundary
+# rather than as noise.
+BOUNDARY_DROP_PCT = 18.0
+
+
+def gathers_for_target(probe_seconds: float,
+                       target_seconds: float = TARGET_PASS_SECONDS) -> int:
+    """
+    How many gathers to repeat per timed pass, from one probe gather.
+
+    Pure function so the sizing logic can be tested without depending on how
+    fast the test machine happens to be. Always at least 1.
+    """
+    if probe_seconds <= 0:
+        return 1
+    return max(1, int(target_seconds / probe_seconds))
+
+
+def _measure_overhead_floor(rng: np.random.Generator) -> float:
+    """
+    Measure the per-lookup cost that is NOT memory: NumPy's call overhead plus
+    an L1-resident access.
+
+    With GATHER_MODE set to 'wrap' this is small — under a nanosecond on a
+    modern core — so the subtraction below is a minor correction rather than
+    the load-bearing step it was when index bounds checking dominated. It is
+    still measured rather than assumed, because it differs by platform and by
+    NumPy build.
+    """
+    elements = 4096                      # 32 KB, comfortably L1-resident
+    source = rng.integers(0, 2**40, size=elements, dtype=np.int64)
+    indices = rng.integers(0, elements, size=LOOKUPS, dtype=np.int32)
+    out = np.empty(LOOKUPS, dtype=np.int64)
+
+    np.take(source, indices, out=out, mode=GATHER_MODE)
+    probe_start = time.perf_counter()
+    np.take(source, indices, out=out, mode=GATHER_MODE)
+    per_pass = gathers_for_target(max(time.perf_counter() - probe_start, 1e-9))
+
+    durations = []
+    for _ in range(REPS):
+        t0 = time.perf_counter()
+        for _ in range(per_pass):
+            np.take(source, indices, out=out, mode=GATHER_MODE)
+        durations.append(max(time.perf_counter() - t0, 1e-9))
+
+    best = min(durations) / per_pass
+    return best / LOOKUPS * 1e9
+
+
+def _warm_up(rng: np.random.Generator, seconds: float = SWEEP_WARMUP_SECONDS) -> int:
+    """
+    Untimed work before the sweep starts, so the first sizes measured are not
+    measured at idle clock. Uses a mid-sized working set so both the cores and
+    the memory controller are active.
+    """
+    elements = 4 * 1024 * 1024 // BYTES_PER_ELEMENT * 4
+    source = rng.integers(0, 2**40, size=elements, dtype=np.int64)
+    indices = rng.integers(0, elements, size=LOOKUPS, dtype=np.int32)
+    out = np.empty(LOOKUPS, dtype=np.int64)
+
+    start = time.perf_counter()
+    gathers = 0
+    while time.perf_counter() - start < seconds:
+        np.take(source, indices, out=out, mode=GATHER_MODE)
+        gathers += 1
+    return gathers
+
+
+def _measure_size(size_mb: float, rng: np.random.Generator,
+                  reps: int = REPS) -> Dict[str, Any]:
+    """Random-gather throughput at one working-set size."""
+    elements = max(1024, int(size_mb * 1024 * 1024 / BYTES_PER_ELEMENT))
+
+    source = rng.integers(0, 2**40, size=elements, dtype=np.int64)
+    indices = rng.integers(0, elements, size=LOOKUPS, dtype=np.int32)
+    out = np.empty(LOOKUPS, dtype=np.int64)
+
+    # Untimed: fault in pages, then time one gather to size the pass.
+    np.take(source, indices, out=out, mode=GATHER_MODE)
+    probe_start = time.perf_counter()
+    np.take(source, indices, out=out, mode=GATHER_MODE)
+    probe = max(time.perf_counter() - probe_start, 1e-9)
+    gathers_per_pass = gathers_for_target(probe)
+
+    # Untimed warmup at this size, long enough to settle.
+    warm_start = time.perf_counter()
+    while time.perf_counter() - warm_start < 0.05:
+        np.take(source, indices, out=out, mode=GATHER_MODE)
+
+    durations: List[float] = []
+    for _ in range(reps):
+        t0 = time.perf_counter()
+        for _ in range(gathers_per_pass):
+            np.take(source, indices, out=out, mode=GATHER_MODE)
+        durations.append(max(time.perf_counter() - t0, 1e-9))
+
+    # Fastest half: an interfered pass can only be slower (see
+    # robust_throughput in common.py for the full argument).
+    fastest = sorted(durations)[:max(2, (len(durations) + 1) // 2)]
+    best_pass = statistics.fmean(fastest)
+    per_gather = best_pass / gathers_per_pass
+
+    return {
+        "size_mb": size_mb,
+        "elements": elements,
+        "lookups_per_sec_millions": round(LOOKUPS / per_gather / 1e6, 2),
+        "ns_per_lookup": round(per_gather / LOOKUPS * 1e9, 2),
+        "gathers_per_pass": gathers_per_pass,
+        "pass_ms": round(best_pass * 1000, 2),
+        "checksum": int(out[0]),      # keeps the gather from being elided
+    }
+
+
+def measure_hierarchy(sizes_mb: Optional[List[float]] = None,
+                      reps: int = REPS) -> Dict[str, Any]:
+    """
+    Sweep working-set size and report the throughput curve plus detected
+    cache boundaries.
+    """
+    sizes = sizes_mb or SWEEP_SIZES_MB
+    rng = np.random.default_rng(90210)
+
+    warmup_gathers = _warm_up(rng)
+    overhead_ns = _measure_overhead_floor(rng)
+    logger.info("Hierarchy sweep warmup: %d gathers, overhead floor %.2f ns/lookup",
+                warmup_gathers, overhead_ns)
+
+    points: List[Dict[str, Any]] = []
+    for size_mb in sizes:
+        point = _measure_size(size_mb, rng, reps=reps)
+        points.append(point)
+        logger.info("  %7.1f MB: %6.2f M lookups/s (%6.2f ns each)",
+                    size_mb, point["lookups_per_sec_millions"],
+                    point["ns_per_lookup"])
+
+    # Subtract the non-memory floor so the curve's dynamic range reflects the
+    # hierarchy rather than NumPy's call overhead.
+    for point in points:
+        memory_ns = point["ns_per_lookup"] - overhead_ns
+        point["memory_ns_per_lookup"] = round(max(0.0, memory_ns), 2)
+        # A corrected value smaller than the floor is a difference between two
+        # similar numbers and should not be read as precise.
+        point["correction_reliable"] = bool(memory_ns >= overhead_ns * 0.5)
+
+    boundaries: List[Dict[str, Any]] = []
+    for prev, cur in zip(points, points[1:]):
+        before = prev["lookups_per_sec_millions"]
+        after = cur["lookups_per_sec_millions"]
+        if before <= 0:
+            continue
+        drop = (before - after) / before * 100.0
+        if drop >= BOUNDARY_DROP_PCT:
+            boundaries.append({
+                "between_mb": [prev["size_mb"], cur["size_mb"]],
+                "drop_pct": round(drop, 1),
+                "before_m_lookups": before,
+                "after_m_lookups": after,
+            })
+
+    rates = [p["lookups_per_sec_millions"] for p in points if p["lookups_per_sec_millions"] > 0]
+    cliff_ratio = round(max(rates) / min(rates), 2) if len(rates) > 1 and min(rates) > 0 else None
+
+    # Cliff ratio with the overhead floor removed. This is the figure that can
+    # be compared against expectations for a memory subsystem; the raw ratio
+    # above is compressed by NumPy overhead and will always look flatter.
+    #
+    # Only points whose correction is reliable are used. Including an
+    # unreliable one puts a difference-of-similar-numbers in the denominator
+    # and inflates the ratio wildly -- on one run that turned a defensible
+    # 11x into 42x purely from a 0.34 ns denominator.
+    corrected = [p["memory_ns_per_lookup"] for p in points
+                 if p["memory_ns_per_lookup"] > 0 and p["correction_reliable"]]
+    corrected_ratio = (round(max(corrected) / min(corrected), 2)
+                       if len(corrected) > 1 and min(corrected) > 0 else None)
+
+    return {
+        "points": points,
+        "boundaries": boundaries,
+        "cache_cliff_ratio": cliff_ratio,
+        "cache_cliff_ratio_corrected": corrected_ratio,
+        "overhead_ns_per_lookup": round(overhead_ns, 2),
+        "fastest_m_lookups": max(rates) if rates else 0.0,
+        "slowest_m_lookups": min(rates) if rates else 0.0,
+        "dram_ns_per_lookup": points[-1]["ns_per_lookup"] if points else None,
+        "cached_ns_per_lookup": points[0]["ns_per_lookup"] if points else None,
+        "lookups_per_gather": LOOKUPS,
+        "warmup_gathers": warmup_gathers,
+        "note": ("Random-gather throughput versus working-set size. Not a "
+                 "latency measurement: see the module docstring for why a "
+                 "pointer chase cannot be done honestly in NumPy. "
+                 "`ns_per_lookup` includes NumPy call overhead of roughly "
+                 f"{overhead_ns:.1f} ns; `memory_ns_per_lookup` has that "
+                 "subtracted and is the figure to compare against expectations."),
+    }

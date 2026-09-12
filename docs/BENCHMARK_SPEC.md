@@ -1,6 +1,6 @@
 # BenchMind Benchmark Specification
 
-Version 2.2.2 · baseline set `2.1.0`
+Version 2.4.0 · baseline set `2.4.0`
 
 This document is the contract for what a BenchMind score means. If you change
 a workload, a baseline, or a scoring rule, change this file in the same commit
@@ -119,6 +119,41 @@ PID, and each worker builds and caches its workload context, all before the
 | `branch_heavy` | branch_bound | Mops/sec | 32 MB table | sort + binary search + random gather |
 | `interpreter` | runtime_bound | Mops/sec | — | **excluded from the index** |
 
+### 3.5 Memory hierarchy sweep (diagnostic, not scored)
+
+`memory_hierarchy.py` measures random-gather throughput as the working set
+grows from 512 KB to 256 MB. Knees in that curve are cache boundaries; the
+top-to-bottom ratio is the cache cliff.
+
+It is **not** a latency benchmark and does not claim to be. A pointer chase is
+inherently serial, so in NumPy the loop runs at Python level and interpreter
+dispatch (~50 ns) swamps the memory latency being measured (1–100 ns). The
+curve measures the same underlying property honestly.
+
+Known limitation: the index array occupies 512 KB of cache, so the L1
+boundary is invisible and L2 is partly obscured. The sweep starts at 512 KB
+for that reason.
+
+**Index bounds checking must be disabled.** `np.take` defaults to
+`mode='raise'`, which validates every index at a cost of about 6.3 ns per
+lookup against 0.9 ns for the gather itself. Every index in BenchMind's
+gathers is generated in range by construction, so the check can never fire and
+`mode='wrap'` is identical in result.
+
+Leaving it on compressed this sweep's entire dynamic range into a 2.2x cliff
+where real hardware shows 5-10x, and made the cache-resident end of the curve
+unmeasurable. It was also corrupting `branch_heavy`, whose gather is
+documented as defeating the prefetcher but was spending most of its time on
+index validation.
+
+A residual overhead floor is still measured with an L1-resident gather and
+reported as `overhead_ns_per_lookup`, with `memory_ns_per_lookup` and
+`cache_cliff_ratio_corrected` derived from it. Points whose corrected value
+sits close to that floor carry `correction_reliable: false` and are excluded
+from the corrected ratio.
+
+Deliberately excluded from the CPU Index. Run with `run.py bench --memory`.
+
 ### 3.1 On `vector_simd` versus `floating_point`
 These run the same kernel shape at two different working-set sizes. The ratio
 between them is the machine's cache cliff and drives the roofline verdict in
@@ -182,16 +217,21 @@ Pinning    logical core 10 (last P-core, away from core 0)
 Conditions validity gate 'valid', mains power, idle, 5 passes
 ```
 
-| Category | R2 median | Unit | Spread |
-|---|---|---|---|
-| integer | 2106.52 | Mops/sec | 0.74% |
-| floating_point | 5137.51 | MFLOPS | 1.68% |
-| matrix | 46.88 | GFLOPS | 0.16% |
-| vector_simd | 1.73 | GFLOPS | 0.45% |
-| compression | 24.84 | MB/s | 0.14% |
-| hashing | 849.14 | MB/s | 0.28% |
-| branch_heavy | 32.30 | Mops/sec | 0.74% |
-| interpreter | 45.06 | Mops/sec | 0.49% |
+| Category | R2 median | Unit | Spread | vs 2.1.0 |
+|---|---|---|---|---|
+| integer | 2258.54 | Mops/sec | 0.45% | +7.2% |
+| floating_point | 5251.46 | MFLOPS | 3.23% | +2.2% |
+| matrix | 47.07 | GFLOPS | 0.20% | +0.4% |
+| vector_simd | 1.75 | GFLOPS | 0.42% | +1.2% |
+| compression | 24.89 | MB/s | 0.21% | +0.2% |
+| hashing | 870.27 | MB/s | 1.11% | +2.5% |
+| branch_heavy | 34.72 | Mops/sec | 1.12% | +7.5% | **stale, see 2.4.0** |
+| interpreter | 45.45 | Mops/sec | 0.40% | +0.9% |
+
+The `vs 2.1.0` column is the estimator change (section 2.3d) at work.
+Categories that were never contended moved under 2.5%; `integer` and
+`branch_heavy` moved over 7%, which is exactly the SMT contention the old
+median estimator was absorbing.
 
 **Why R2 replaced R1.** R1 was a shared cloud instance: noisy neighbours,
 unknown turbo behaviour, and no way to control its conditions. R2 is physical
@@ -405,5 +445,7 @@ Recorded honestly rather than hidden:
 4. **The SMT sibling of the pinned core cannot be reserved.** Other processes
    may be scheduled onto it, sharing execution resources with the measurement.
    Reported, not solved.
-5. **No RAM latency, storage, or network benchmark** yet.
+5. **No storage or network benchmark** yet. Memory is covered by the
+   hierarchy sweep (section 3.5), but true latency remains unmeasurable from
+   NumPy.
 6. **The GPU baselines are still untested placeholders.** They have never been measured on real hardware; run the suite on a real GPU and recalibrate before treating GPU scores as meaningful.

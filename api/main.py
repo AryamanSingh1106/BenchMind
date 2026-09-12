@@ -33,11 +33,17 @@ from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
 from _version import __version__
-from ai.analysis import analyze_bottleneck, analyze_scaling, analyze_throttling
+from ai.analysis import (
+    analyze_bottleneck,
+    analyze_memory_hierarchy,
+    analyze_scaling,
+    analyze_throttling,
+)
 from ai.stability_engine import build_stability_report
 from ai.summary_engine import generate_summary
 from api.jobs import job_manager
 from benchmarks.cpu.cpu_suite import run_full_cpu_suite
+from benchmarks.cpu.memory_hierarchy import measure_hierarchy
 from benchmarks.cpu.multi_core import run_scaling_curve
 from benchmarks.cpu_test import warmup_cpu
 from benchmarks.gpu.gpu_suite import run_gpu_suite
@@ -81,6 +87,9 @@ class BenchmarkRequest(BaseModel):
     include_gpu: bool = True
     include_scaling: bool = Field(
         False, description="Sweep thread counts. Adds a minute or more.")
+    include_memory_hierarchy: bool = Field(
+        False, description="Sweep working-set size to map the cache hierarchy. "
+                           "Adds roughly a minute. Diagnostic only; not scored.")
     skip_validity_gate: bool = Field(
         False, description="Run even if conditions are bad. Result is marked invalid.")
     save_to_history: bool = True
@@ -185,6 +194,11 @@ def _execute_benchmark(req: BenchmarkRequest, progress=None) -> Dict[str, Any]:
         emit("scaling_curve", 0.78)
         scaling_curve = run_scaling_curve(workload_key="integer", reps=3)
 
+    hierarchy = None
+    if req.include_memory_hierarchy:
+        emit("memory_hierarchy", 0.84)
+        hierarchy = measure_hierarchy()
+
     end_mono = time.monotonic()
     emit("analysis", 0.90)
 
@@ -194,6 +208,9 @@ def _execute_benchmark(req: BenchmarkRequest, progress=None) -> Dict[str, Any]:
     throttle = analyze_throttling(timeline)
     bottleneck = analyze_bottleneck(cpu_result.get("subtests", []))
     scaling_analysis = analyze_scaling(scaling_curve) if scaling_curve else None
+    hierarchy_analysis = (
+        analyze_memory_hierarchy(hierarchy, cpu_result.get("subtests", []))
+        if hierarchy else None)
 
     store = get_store()
     fingerprint_hash = (cpu_result.get("environment") or {}).get("fingerprint_hash")
@@ -222,6 +239,7 @@ def _execute_benchmark(req: BenchmarkRequest, progress=None) -> Dict[str, Any]:
         bottleneck=bottleneck,
         scaling=scaling_analysis,
         validity=validity_report.to_dict(),
+        memory_hierarchy=hierarchy_analysis,
     )
 
     result: Dict[str, Any] = {
@@ -236,6 +254,8 @@ def _execute_benchmark(req: BenchmarkRequest, progress=None) -> Dict[str, Any]:
         "scaling_analysis": scaling_analysis,
         "throttling": throttle,
         "bottleneck": bottleneck,
+        "memory_hierarchy": hierarchy,
+        "memory_hierarchy_analysis": hierarchy_analysis,
         "stability": stability.to_dict(),
         "summary": summary,
         "timeline": timeline,
@@ -348,6 +368,8 @@ def dashboard_data() -> Dict[str, Any]:
         "gpu": r.get("gpu_benchmark"),
         "throttling": r.get("throttling"),
         "bottleneck": r.get("bottleneck"),
+        "memory_hierarchy": r.get("memory_hierarchy"),
+        "memory_hierarchy_analysis": r.get("memory_hierarchy_analysis"),
         "scaling_curve": r.get("scaling_curve"),
         "scaling_analysis": r.get("scaling_analysis"),
         "stability": r.get("stability"),

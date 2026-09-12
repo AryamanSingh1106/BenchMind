@@ -50,6 +50,7 @@ def generate_summary(
     bottleneck: Optional[Dict[str, Any]] = None,
     scaling: Optional[Dict[str, Any]] = None,
     validity: Optional[Dict[str, Any]] = None,
+    memory_hierarchy: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """
     Build the narrative. Accepts the 1.x positional signature so old callers
@@ -102,6 +103,11 @@ def generate_summary(
 
     if scaling and scaling.get("summary"):
         insights.append(scaling["summary"])
+
+    if memory_hierarchy and memory_hierarchy.get("summary"):
+        insights.append(memory_hierarchy["summary"])
+        if memory_hierarchy.get("branch_heavy_note"):
+            insights.append(memory_hierarchy["branch_heavy_note"])
 
     if throttle:
         insights.append(throttle.get("summary", ""))

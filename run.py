@@ -48,6 +48,7 @@ def cmd_bench(args: argparse.Namespace) -> int:
         mode=args.mode,
         include_gpu=not args.no_gpu,
         include_scaling=args.scaling,
+        include_memory_hierarchy=args.memory,
         skip_validity_gate=args.force,
         save_to_history=not args.no_save,
         llm_report=args.llm,
@@ -124,6 +125,31 @@ def _print_report(result: Dict[str, Any]) -> None:
     elif isinstance(gpu, dict) and gpu.get("reason"):
         rule("gpu")
         print(f"  {gpu['reason']}")
+
+    hierarchy = result.get("memory_hierarchy")
+    if hierarchy and hierarchy.get("points"):
+        rule("memory hierarchy (random access)")
+        print(f"  {'size':>9}  {'throughput':>16}  {'total':>8}  {'memory':>8}")
+        for point in hierarchy["points"]:
+            flag = "" if point.get("correction_reliable", True) else "  *"
+            print(f"  {point['size_mb']:>6.1f} MB  "
+                  f"{point['lookups_per_sec_millions']:>10.2f} M/s  "
+                  f"{point['ns_per_lookup']:>7.2f} ns  "
+                  f"{point.get('memory_ns_per_lookup', 0):>7.2f} ns{flag}")
+        floor = hierarchy.get("overhead_ns_per_lookup")
+        if floor is not None:
+            print(f"  overhead floor {floor:.2f} ns/lookup, subtracted in the "
+                  "'memory' column")
+        raw = hierarchy.get("cache_cliff_ratio")
+        corrected = hierarchy.get("cache_cliff_ratio_corrected")
+        if raw:
+            line = f"  cliff ratio {raw:.2f}x"
+            if corrected:
+                line += f" raw, {corrected:.2f}x with overhead removed"
+            print(line)
+        if any(not p.get("correction_reliable", True) for p in hierarchy["points"]):
+            print("  * corrected value is close to the overhead floor; treat as "
+                  "indicative only")
 
     rule("findings")
     for line in summary.get("insights", []):
@@ -239,6 +265,9 @@ def build_parser() -> argparse.ArgumentParser:
     bench.add_argument("--mode", choices=["quick", "standard", "full"], default="standard")
     bench.add_argument("--no-gpu", action="store_true", help="Skip the GPU suite.")
     bench.add_argument("--scaling", action="store_true", help="Sweep thread counts.")
+    bench.add_argument("--memory", action="store_true",
+                       help="Sweep working-set size to map the cache hierarchy. "
+                            "Diagnostic only; not scored.")
     bench.add_argument("--force", action="store_true",
                        help="Run even when conditions are unusable.")
     bench.add_argument("--no-save", action="store_true", help="Do not write to local history.")

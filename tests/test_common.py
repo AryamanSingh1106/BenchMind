@@ -286,6 +286,192 @@ class TestTimedRunner(unittest.TestCase):
         self.assertIsInstance(result.score_ci_pct, float)
 
 
+class TestContentionHandling(unittest.TestCase):
+    """
+    Interference in a pinned single-thread measurement is one-directional: a
+    competing thread can only make it slower. The median treats a slow
+    repetition as equally likely to be signal, which is why reference machine
+    R2 reported integer at 1,185 Mops/sec against a 2,106 baseline while five
+    other categories sat within 2%.
+    """
+
+    def test_estimator_ignores_a_slow_tail(self):
+        from benchmarks.cpu.common import robust_throughput
+
+        clean = robust_throughput([2100.0] * 9)
+        partly = robust_throughput([2100.0] * 7 + [1150.0] * 2)
+
+        self.assertAlmostEqual(clean["estimate"], partly["estimate"], delta=1.0,
+                               msg="a slow tail must not drag the estimate down")
+        self.assertEqual(partly["contention_pct"], 0.0)
+
+    def test_sustained_contention_is_detected(self):
+        from benchmarks.cpu.common import CONTENTION_RETRY_PCT, robust_throughput
+
+        result = robust_throughput([2100.0] * 3 + [1150.0] * 6)
+        self.assertGreater(result["contention_pct"], CONTENTION_RETRY_PCT,
+                           "widespread contention must be flagged for retry")
+        self.assertGreater(result["estimate"], 1150.0)
+
+    def test_estimator_is_not_just_the_maximum(self):
+        """
+        Best-of-N would flatter a machine that got one lucky repetition. The
+        mean of the fastest half is robust without being optimistic.
+        """
+        from benchmarks.cpu.common import robust_throughput
+
+        result = robust_throughput([3000.0] + [2000.0] * 8)
+        self.assertLess(result["estimate"], 3000.0)
+        self.assertGreater(result["estimate"], 2000.0)
+
+    def test_few_samples_fall_back_to_median(self):
+        from benchmarks.cpu.common import robust_throughput
+
+        result = robust_throughput([100.0, 200.0, 150.0])
+        self.assertEqual(result["estimate"], 150.0)
+
+    def test_empty_input_is_safe(self):
+        from benchmarks.cpu.common import robust_throughput
+        self.assertEqual(robust_throughput([])["estimate"], 0.0)
+        self.assertEqual(robust_throughput([0.0, float("nan")])["estimate"], 0.0)
+
+    def test_result_reports_attempts_and_contention(self):
+        from benchmarks.cpu import registry
+
+        result = run_timed_subtest(registry.get("integer"), scale=0.05,
+                                   target_duration=0.05, min_reps=5, max_reps=6)
+        self.assertGreaterEqual(result.attempts, 1)
+        self.assertLessEqual(result.attempts, 3)
+        self.assertGreaterEqual(result.contention_pct, 0.0)
+
+
+class TestMemoryHierarchySizing(unittest.TestCase):
+    """
+    Pure-function tests for the sweep's pass sizing.
+
+    These replace an earlier pair of tests that asserted on measured timings
+    and therefore flaked: on a battery-powered laptop the curve came back
+    non-monotonic and the suite failed, then passed on mains. That violates
+    the project's own rule that no test may assert on how fast anything runs
+    (PROJECT_CONTEXT.md rule 13). A flaky test is worse than no test, because
+    it teaches people to re-run instead of to look.
+    """
+
+    def test_pass_sizing_hits_the_target(self):
+        from benchmarks.cpu.memory_hierarchy import gathers_for_target
+
+        # A 0.5 ms gather needs ~50 repeats to fill a 25 ms pass.
+        self.assertEqual(gathers_for_target(0.0005, target_seconds=0.025), 50)
+        # A gather already longer than the target needs exactly one.
+        self.assertEqual(gathers_for_target(0.040, target_seconds=0.025), 1)
+
+    def test_pass_sizing_never_returns_zero(self):
+        from benchmarks.cpu.memory_hierarchy import gathers_for_target
+
+        for probe in (0.0, -1.0, 1e9, 1e-12):
+            self.assertGreaterEqual(gathers_for_target(probe), 1)
+
+    def test_sizing_scales_inversely_with_gather_cost(self):
+        from benchmarks.cpu.memory_hierarchy import gathers_for_target
+
+        fast = gathers_for_target(0.0002)
+        slow = gathers_for_target(0.002)
+        self.assertGreater(fast, slow)
+
+
+class TestMemoryHierarchyStructure(unittest.TestCase):
+    """
+    Structural tests on a real sweep. Nothing here asserts on speed; a loaded
+    or battery-powered machine changes the numbers but not the shape.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        from benchmarks.cpu.memory_hierarchy import measure_hierarchy
+        cls.result = measure_hierarchy(sizes_mb=[0.5, 8, 64], reps=3)
+
+    def test_every_point_is_fully_described(self):
+        for point in self.result["points"]:
+            for key in ("size_mb", "elements", "lookups_per_sec_millions",
+                        "ns_per_lookup", "memory_ns_per_lookup",
+                        "correction_reliable", "gathers_per_pass", "pass_ms"):
+                self.assertIn(key, point)
+            self.assertGreater(point["lookups_per_sec_millions"], 0)
+            self.assertGreaterEqual(point["gathers_per_pass"], 1)
+
+    def test_overhead_floor_is_measured_and_subtracted(self):
+        floor = self.result["overhead_ns_per_lookup"]
+        self.assertGreater(floor, 0.0,
+                           "NumPy call overhead is real and must be quantified")
+        for point in self.result["points"]:
+            self.assertAlmostEqual(
+                point["memory_ns_per_lookup"],
+                max(0.0, point["ns_per_lookup"] - floor),
+                places=1)
+
+    def test_corrected_ratio_ignores_unreliable_points(self):
+        """
+        A corrected value smaller than the floor is a difference of similar
+        numbers. Using one as a denominator once turned a defensible 11x cliff
+        ratio into 42x.
+        """
+        from benchmarks.cpu.memory_hierarchy import measure_hierarchy
+
+        # Re-derive the ratio from the reported points and check it matches.
+        reliable = [p["memory_ns_per_lookup"] for p in self.result["points"]
+                    if p["correction_reliable"] and p["memory_ns_per_lookup"] > 0]
+        if len(reliable) > 1:
+            expected = round(max(reliable) / min(reliable), 2)
+            self.assertEqual(self.result["cache_cliff_ratio_corrected"], expected)
+        else:
+            self.assertIsNone(self.result["cache_cliff_ratio_corrected"])
+
+    def test_largest_working_set_is_not_the_fastest(self):
+        """
+        The one physical claim safe to assert: a 64 MB working set cannot be
+        faster than a 512 KB one. Stated with generous tolerance so a busy
+        machine does not fail it.
+        """
+        rates = [p["lookups_per_sec_millions"] for p in self.result["points"]]
+        self.assertGreater(rates[0] * 1.5, rates[-1],
+                           f"largest working set measured fastest: {rates}")
+
+    def test_is_not_in_the_cpu_index(self):
+        """
+        Adding it would change the index's meaning and invalidate every stored
+        baseline, for information more useful as a curve than a score.
+        """
+        from benchmarks.cpu import registry
+        self.assertNotIn("memory_hierarchy", [w.category for w in registry.WORKLOADS])
+
+    def test_analysis_handles_a_missing_sweep(self):
+        from ai.analysis import analyze_memory_hierarchy
+
+        self.assertEqual(analyze_memory_hierarchy(None)["verdict"], "not_measured")
+        self.assertEqual(analyze_memory_hierarchy({})["verdict"], "not_measured")
+
+    def test_analysis_connects_to_branch_heavy(self):
+        from ai.analysis import analyze_memory_hierarchy
+
+        hierarchy = {
+            "points": [{"size_mb": 0.5, "lookups_per_sec_millions": 400.0,
+                        "ns_per_lookup": 2.5},
+                       {"size_mb": 256, "lookups_per_sec_millions": 50.0,
+                        "ns_per_lookup": 20.0}],
+            "cache_cliff_ratio": 8.0,
+            "cached_ns_per_lookup": 2.5,
+            "dram_ns_per_lookup": 20.0,
+            "boundaries": [{"between_mb": [8, 16], "drop_pct": 40.0}],
+        }
+        subtests = [{"category": "branch_heavy", "threads": 1,
+                     "validation_passed": True, "score": 802.0}]
+
+        result = analyze_memory_hierarchy(hierarchy, subtests)
+        self.assertEqual(result["verdict"], "latency_limited")
+        self.assertIn("branch_heavy", result["branch_heavy_note"])
+        self.assertIn("802", result["branch_heavy_note"])
+
+
 class TestAdaptiveChunking(unittest.TestCase):
     """
     Multi-core wave selection. Through 2.1.1 this was fixed at 2 waves, which

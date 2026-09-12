@@ -10,7 +10,7 @@
 > - `docs/BENCHMARK_SPEC.md` — methodology, baselines, scoring (**the contract**)
 > - `CHANGELOG.md` — what changed and when
 
-Version 2.2.2
+Version 2.4.0
 
 ---
 
@@ -87,7 +87,8 @@ BenchMind/
 │   │   ├── registry.py        single source of truth for workloads
 │   │   ├── payloads.py        deterministic mixed-entropy corpora
 │   │   ├── integer.py … interpreter.py   the eight workloads
-│   │   ├── _worker.py         spawn-safe worker with context caching
+│   │   │   ├── memory_hierarchy.py  cache-cliff sweep (diagnostic, unscored)
+│   ├── _worker.py         spawn-safe worker with context caching
 │   │   ├── single_core.py     BLAS isolation, core pinning
 │   │   ├── multi_core.py      warm pool, scaling curve
 │   │   └── cpu_suite.py       orchestrator
@@ -171,7 +172,12 @@ reintroduces the bug.
 7e. **Any spread computed across stored runs must filter to valid runs only.**
     The fingerprint excludes power state by design, so battery and mains runs
     share a fingerprint and only the validity verdict separates them.
-7f. **Watch for implicit allocation in the timed region.** `np.searchsorted(...)`
+7f. **Disable index bounds checking on every gather.** `np.take` defaults to
+    `mode='raise'`, which costs ~6.3 ns per lookup against ~0.9 ns for the
+    gather. BenchMind's indices are always in range by construction. Leaving
+    it on compressed the memory sweep's cliff ratio from 5.7x to 2.2x and made
+    `branch_heavy` measure validation rather than the prefetcher.
+7g. **Watch for implicit allocation in the timed region.** `np.searchsorted(...)`
     and `arr[idx]` allocate their results; only `out=` parameters avoid it.
     Reductions and verification belong in `validate`, not `run`.
 8. **Never benchmark a CPU OpenCL runtime as a GPU.** Filter on
@@ -191,10 +197,20 @@ reintroduces the bug.
 10e. **A dependent FMA chain must use a multiplier below 1.** Above 1 it grows
     as y^n and overflows once the loop count is tuned up. This defect has now
     appeared twice, in the CPU and GPU kernels independently.
+10f. **EVERY timed thing needs duration-based warmup and a work size that
+    clears the 20 ms floor.** CPU repetitions, GPU launches and the memory
+    sweep's passes have each had this bug independently. When adding any new
+    measurement, size the work from a probe and warm up by elapsed time --
+    never by a fixed count.
+10g. **Prefer the fastest half to the median for pinned measurements.**
+    Interference is one-directional; a central estimator is biased downward.
 11. **Never compare across fingerprints, modes or baseline versions.**
 12. **Importing anything must never require credentials.**
-13. **Never assert on timings in CI.** CI runners are noisy VMs; timing
-    assertions produce flaky failures that teach people to ignore the suite.
+13. **Never assert on timings in CI** — and that includes tests that only
+    look structural. Two hierarchy-sweep tests broke this rule in 2.3.0 and
+    flaked on battery power. Extract the sizing logic as a pure function and
+    test that; assert on structure and on physical impossibilities, never on
+    how fast the machine is.
 
 ---
 
@@ -222,13 +238,15 @@ single-file dashboard.
 **Storage** — SQLite history with fingerprint-aware regression detection.
 Supabase optional.
 
-**Tests** — 124, all passing, none timing-dependent.
+**Tests** — 140, all passing, none timing-dependent. Verified by running the suite three times consecutively after the 2.3.1 test rewrite.
 
 ---
 
 ## 8. Current priority
 
-1. **Done.** Reference R2 calibrated on physical hardware; worst spread 1.68%.
+1. Recalibrate `branch_heavy` (`python -m scripts.calibrate_baselines --reps 5`).
+   Its stored baseline predates the 2.4.0 gather-mode fix. Other categories
+   are unaffected.
 2. Run `python run.py repeat --runs 5` and confirm spread is under 2%. Expect
    downward drift on a laptop; raise `--cooldown` if it appears.
 3. **Done.** Reference G1 calibrated; worst spread 1.00%.
@@ -238,8 +256,7 @@ Supabase optional.
 6. Storage benchmark.
 7. Native kernels (cffi or Numba) to reduce dependence on the Python stack.
 8. macOS temperature source.
-9. RAM latency benchmark, to explain the low branch_heavy scores seen on
-   mobile parts.
+9. Storage benchmark. (Memory is covered by the hierarchy sweep.)
 
 Do not jump ahead unless explicitly asked.
 

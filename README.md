@@ -3,6 +3,15 @@
 A hardware benchmarking and diagnostics suite that tells you what your machine
 is good at, not just how big a number it can produce.
 
+BenchMind's own development is the best argument for why it reports confidence
+intervals. The first calibration run on the reference machine showed a **36.9%
+spread** on its shortest workload. Four measurement fixes later — interrupt-
+heavy core selection, a working set sized exactly at the L2 boundary, 16 MB of
+hidden allocations inside the timed region, and a warmup too short to reach a
+steady clock — the same machine measures **0.74%**. Every one of those was
+found by the benchmark's own error bars, not by reading the code. The CHANGELOG
+records each.
+
 What makes it different from a score generator:
 
 - **Every score carries a 95% confidence interval**, and BenchMind refuses to
@@ -65,7 +74,7 @@ inventing numbers.
 ```bash
 python run.py check                  # is now a good time to benchmark?
 python run.py bench                  # standard run, CPU + GPU
-python run.py bench --mode full --scaling
+python run.py bench --mode full --scaling --memory
 python run.py repeat --runs 5        # repeatability check
 python run.py history
 python run.py env                    # environment fingerprint

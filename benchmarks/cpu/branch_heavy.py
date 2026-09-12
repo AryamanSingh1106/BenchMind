@@ -48,6 +48,22 @@ QUERIES = 1_000_000
 # requesting a fresh 8 MB region on each repetition.
 SEARCH_CHUNK = 65_536
 
+# Index validation mode.
+#
+# `np.take` defaults to mode='raise', which bounds-checks every index. On an
+# i5-13450HX that check costs about 6.3 ns per lookup against roughly 0.9 ns
+# for the gather itself -- so the default mode spends 86% of its time
+# validating indices rather than touching memory.
+#
+# `gather_idx` comes from `rng.permutation(table_n)[:queries]`, so every
+# index is in range by construction and the check can never fire. 'wrap'
+# produces identical results without it.
+#
+# This matters for what this workload CLAIMS to measure. Its docstring says
+# the gather defeats the hardware prefetcher; with bounds checking on, most of
+# the time went to index validation instead, and the claim was not true.
+GATHER_MODE = "wrap"
+
 
 def setup(scale: float = 1.0) -> Dict[str, Any]:
     # Sizes are fixed. The search table must stay far larger than cache for the
@@ -104,7 +120,8 @@ def run(ctx: Dict[str, Any]) -> Tuple[Dict[str, Any], float]:
 
     # 3. Random gather: defeats hardware prefetch. `np.take` with `out=` writes
     #    into the preallocated buffer; `gather_src[gather_idx]` would not.
-    np.take(ctx["gather_src"], ctx["gather_idx"], out=gathered)
+    #    See GATHER_MODE above for why bounds checking is disabled.
+    np.take(ctx["gather_src"], ctx["gather_idx"], out=gathered, mode=GATHER_MODE)
 
     n, table_n = ctx["n"], ctx["table_n"]
     levels = float(np.log2(max(table_n, 2)))
